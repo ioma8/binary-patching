@@ -65,6 +65,11 @@ audit trail that stops you re-testing the same guess.
   stray bundle-root artifacts first.
 - **osascript** — drive a user action (`tell app "X" to quit`) to capture the
   *correct* backtrace for the split-point diff.
+- **fdis.py** (in this folder) — the fast disassembler: `./fdis.py <file> <addr> [n]`
+  prints `vmaddr fileoff bytes mnemonic operands` by seeking straight to the
+  address — O(n), ~35 ms — instead of dumping the whole `__TEXT` like `otool`
+  (~510 ms) or r2 `pd` (~380 ms). Default for a bare bytes/mnemonic peek at a
+  known address; still use r2 for symbols, xrefs, and `wx`.
 
 ## r2 cheat sheet
 
