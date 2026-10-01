@@ -29,13 +29,15 @@ Modify a compiled binary's behaviour without source.
 4. **Find the decision.** The narrowest patchable site. Blocking A but keeping
    B: capture the backtrace of *both*, find the **split point** where they
    diverge, patch there — not the shared handler. Otherwise the **choke point**
-   (the one call/compare everything funnels through). *Done when:* one
-   function/instruction is named.
+   (the one call/compare everything funnels through). Before committing, prove
+   the candidate runs — set a breakpoint on its call site and see it fire.
+   *Done when:* one function/instruction is named and confirmed live.
 
 5. **Patch minimal.** No-op the smallest function; assert the pristine bytes at
    the site; patch per-arch slice; re-sign (frameworks first, then `--deep` the
-   app); confirm the exact bytes landed. *Done when:* bytes verified and
-   `codesign --verify --deep` passes.
+   app); confirm the exact bytes landed. Patch code the target ships itself —
+   bundled frameworks/dylibs are local and patchable, system frameworks are
+   shared. *Done when:* bytes verified and `codesign --verify --deep` passes.
 
 6. **Verify three times.** The bug is gone **and** the desired behaviour still
    works, three clean runs. *Done when:* 3 green. One green run proves nothing.
@@ -53,7 +55,8 @@ audit trail that stops you re-testing the same guess.
 ## Tooling
 
 - **lldb** — `settings set target.disable-aslr true`; `bt`; break on the
-  terminal API. The single most decisive move.
+  terminal API. The single most decisive move. In stripped dylibs a symbol
+  like `___lldb_unnamed_symbol_1f4f8` — the hex suffix is the file offset.
 - **r2** — `strings` → xrefs → a small `pd` window; read a field's offset/width
   from the instruction that *writes* it, never from memory of the header.
 - **nm / otool** — symbol addresses; `lipo -thin arm64` / `-create` for
@@ -63,12 +66,28 @@ audit trail that stops you re-testing the same guess.
 - **osascript** — drive a user action (`tell app "X" to quit`) to capture the
   *correct* backtrace for the split-point diff.
 
-## Anti-patterns
+## Blind routes (each cost real time — the correction)
 
-Guessing offsets/fields · trusting a single green run · hunting an event's
-poster (unbounded) · blanket early-return on a function family (mixed return
-conventions → crash) · patching mid-function (confirm the prologue first) ·
-trusting a stale crash report · reading whole binaries instead of xrefs.
+- Patching state getters before knowing who reads them → find the comparison
+  that produces the visible symptom first.
+- Assuming a field getter *is* the decision → trace to the branch that consumes it.
+- Blanket early-return on a function family → mixed return conventions crash;
+  no-op the one smallest function.
+- No-op'ing a dialog's `exec()` only → it is still constructed and trips a
+  size/state assert; skip the constructor/caller instead.
+- Patching mid-function → confirm the prologue (`sub sp,sp,#N; stp …`) first.
+- Breakpoints on raw VAs without disabling ASLR → they never hit; disable ASLR
+  or compute the slide.
+- Hunting an event's *poster* → unbounded; patch the handler or the split point.
+- Guessing a struct/field offset → read it from the instruction that writes it.
+- Reusing an existing flag as a one-shot counter → other writers corrupt it;
+  use a byte you own (e.g. `__bss`).
+- Discriminating on a race-dependent flag (e.g. `spontaneous`) → a design
+  smell; prefer the deterministic split point.
+- Trusting a single green run → "works once" then fails; verify 3×.
+- Trusting a stale crash report → timestamp it against the last patch.
+- Patching system frameworks (AppKit/dyld) → patch the target's bundled code.
+- Broad greps / whole-file reads → xrefs + small `pd` windows.
 
 ## arm64 encoding crib
 
