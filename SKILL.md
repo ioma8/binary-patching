@@ -66,6 +66,28 @@ audit trail that stops you re-testing the same guess.
 - **osascript** — drive a user action (`tell app "X" to quit`) to capture the
   *correct* backtrace for the split-point diff.
 
+## r2 cheat sheet
+
+`r2 -q -a arm -b 64 -c '<cmd>' <file>` — `-q` quiet, `-a arm -b 64` = arm64,
+`-c` run-and-exit; add `-w` to write. Operate on a `lipo -thin arm64` slice.
+
+| task | command |
+|---|---|
+| disassemble N insns — **bytes + mnemonic** | `pd N @ 0xADDR` |
+| decode one insn (branch target / immediate) | `ao @ 0xADDR` |
+| find a symbol's address | `is~Name` |
+| find a string | `iz~substring` |
+| list sections (find `__bss` for a counter) | `iS` |
+| function boundaries | `af @ 0xADDR; afi @ 0xADDR` |
+| disassemble a whole function | `pdf @ 0xADDR` |
+| xrefs to an address | `axt 0xADDR` (run `aaa` first on stripped bins) |
+| search raw bytes | `/x 1f510071` |
+| write bytes (quick experiment only) | `wx c0035fd6 @ 0xADDR` |
+
+`pd` is the source of truth for bytes — read the pristine bytes there to assert
+a site, and use `ao` to decode a hand-written `b`/`cbz`/`tbz` target. Do the
+real patch in Python (asserts + `lipo` per-slice), not `wx`.
+
 ## Blind routes (each cost real time — the correction)
 
 - Patching state getters before knowing who reads them → find the comparison
