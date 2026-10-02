@@ -64,59 +64,62 @@ audit trail that stops you re-testing the same guess.
 
 ## Tooling
 
-Per-tool usage and examples: `UTILS.md` (this folder).
+**Reach for the in-folder helpers first.** They are self-contained, super fast
+(a 50 MB slice answers in well under half a second — 0.06–0.25 s measured — and
+milliseconds on a small file) and one command each — no `aaa`, no whole-`__TEXT`
+dump, no flag archaeology. Only drop to `r2` / `otool` / `lldb` for what they
+deliberately do not do: CFG/structural queries, `wx`, dynamic tracing. Usage and
+examples: `UTILS.md`.
 
-- **lldb** — `settings set target.disable-aslr true`; `bt`; break on the
-  terminal API. The single most decisive move. In stripped dylibs a symbol
-  like `___lldb_unnamed_symbol_1f4f8` — the hex suffix is the file offset.
-- **r2** — `strings` → xrefs → a small `pd` window; read a field's offset/width
-  from the instruction that *writes* it, never from memory of the header.
-- **nm / otool — symbols are the map.** Survey first: an unstripped build
-  names the domain (`CHECK*`, `LOAD*`, `IS*`, `Get*`), and if symbols exist most
-  of the job is reading names. `lipo -thin arm64` / `-create` for universal
-  binaries.
-- **Direct-call scan — bound the search.** Enumerate callers of one function by
-  scanning its direct-branch immediates (`bl` on arm64, `call rel32` on x86):
-  exact and O(n), unlike `adrp+add` string-xref heuristics that miss indirection.
-  The caller count is the blast radius of a patch. `find_callers.py` (in this
-  folder) does it vectorized — `./find_callers.py <file> <0xADDR|name>...
-  [--arch arm64|x86_64|x86]`, ~10 ms scan on a 56 MB slice, annotating each
-  site with its containing symbol. arm64 is exact (BL is fixed-width); the
-  x86/x86_64 scan keys off the `0xE8` opcode byte and is a heuristic — it finds
-  every real call but can add a spurious one. Misses indirect/PLT/vtable calls,
-  arm64 tail-calls and the other arch slice.
+- **fdis.py** — disassembler for **arm64 / x86_64 / i386**:
+  `./fdis.py <file> <addr> [n] [--arch arm64|x86_64|x86]` prints
+  `vmaddr fileoff bytes mnemonic operands` by seeking straight to the address —
+  one round trip, milliseconds — instead of dumping the whole `__TEXT` like
+  `otool` (~510 ms) or r2 `pd` (~380 ms).
+- **find_callers.py** — who calls X: `./find_callers.py <file> <0xADDR|name>...
+  [--arch ...]`. Vectorized; each call site is annotated with its containing
+  symbol, and the caller count is the blast radius of a patch. arm64 is exact
+  (BL is fixed-width); the x86/x86_64 scan keys off the `0xE8` opcode byte — it
+  finds every real direct call and may add a spurious one. Misses indirect/PLT/
+  vtable calls, arm64 tail-calls and the other arch slice.
+- **find_refs.py** — who references X: code refs plus pointer refs in data
+  (vtables, dispatch tables, `RESSTR` indirection).
+  `./find_refs.py <file> <0xADDR|name>... [--str <text>] [--arch ...]`. arm64 code
+  refs (`adrp+add`, `adrp+ldr/str`, `adr`) are exact; x86/x86_64 match the 32-bit
+  displacement/immediate field vectorized (near-exact; only i386 PIC refs through
+  the GOT are missed). The pointer scan is pointer-width aware on every arch and
+  catches the indirection a call scan cannot.
+- **find_strings.py** — strings with their **addresses** (not file offsets):
+  `./find_strings.py <file> [pattern] [--section S] [--min N] [--regex]`.
+  Section contents only, no symbol-table noise; skips `__text` unless `--all`;
+  feeds straight into `find_refs.py`.
+- **patch.py** — declarative, all-or-nothing applier: it asserts every site
+  before writing any. Manifest lines `<arch> <site> <old_hex> <new_hex>` with
+  `<arch>` = `arm64`/`x86_64`/`x86`/`*`, and `<site>` a VA or a symbol name
+  (symbol sites survive updates that move addresses).
+  `--dry-run` / `--check` / `--resign`.
+- **resign.py** — `./resign.py <path> [--runtime]`: ad-hoc sign without the
+  hardened runtime (the working default), then verify.
+
+External tools, as fallbacks:
+
+- **nm / otool — symbols are the map.** Survey first: an unstripped build names
+  the domain (`CHECK*`, `LOAD*`, `IS*`, `Get*`); if symbols exist most of the job
+  is reading names. `lipo -thin arm64` / `-create` for universal binaries.
+- **r2** — for CFG/structural queries and `wx` (writes): `strings` → xrefs → a
+  small `pd` window; read a field's offset/width from the instruction that
+  *writes* it, never from memory of the header. Use the in-folder helpers for
+  anything they already cover — `r2 -A` on a 50 MB binary is seconds to minutes.
+- **lldb** — dynamic tracing, not disassembly: `settings set target.disable-aslr
+  true`; `bt`; break on the terminal API. The single most decisive move. In
+  stripped dylibs a symbol like `___lldb_unnamed_symbol_1f4f8` — the hex suffix
+  is the file offset.
 - **codesign** — `-f -s -` the framework, then `--deep --force` the app; delete
   stray bundle-root artifacts first. On a hardened-runtime app re-sign **ad-hoc
   without runtime**: library validation rejects the freshly re-signed bundled
-  dylibs if runtime is kept (`resign.py` below does this).
+  dylibs if runtime is kept (`resign.py` above does this).
 - **osascript** — drive a user action (`tell app "X" to quit`) to capture the
   *correct* backtrace for the split-point diff.
-- **fdis.py** (in this folder) — the fast disassembler for **arm64, x86_64 and
-  i386**: `./fdis.py <file> <addr> [n] [--arch arm64|x86_64|x86]` prints
-  `vmaddr fileoff bytes mnemonic operands` by seeking straight to the address —
-  O(n), ~35 ms — instead of dumping the whole `__TEXT` like `otool` (~510 ms) or
-  r2 `pd` (~380 ms). Default for a bare bytes/mnemonic peek at a known address;
-  still use r2 for structural queries and `wx`.
-- **find_refs.py** (in this folder) — "who references X": code refs plus pointer
-  refs in data (vtables, dispatch tables, `RESSTR` indirection).
-  `./find_refs.py <file> <0xADDR|name>... [--str <text>] [--arch ...]`. arm64 code
-  refs (`adrp+add`, `adrp+ldr/str`, `adr`) are exact; x86/x86_64 match the 32-bit
-  displacement/immediate field vectorized (near-exact — one disassembly per hit,
-  not per instruction; only i386 PIC refs through the GOT are missed). The
-  pointer scan is pointer-width aware and works on every arch — it catches the
-  indirection a call scan cannot.
-- **find_strings.py** (in this folder) — strings with their addresses: printable
-  runs in section contents (no symbol-table noise) with an unstrided VA and
-  section, so a string feeds straight into `find_refs.py`.
-  `./find_strings.py <file> [pattern] [--section S] [--min N] [--regex]`.
-- **patch.py** (in this folder) — declarative applier. Manifest lines
-  `<arch> <site> <old_hex> <new_hex>` with `<arch>` = `arm64`/`x86_64`/`x86`/`*`,
-  where `<site>` is a VA or a **symbol name** (`_..._GETSTATUS$$TSTATUS`, optional
-  `+0xoff`); symbol sites survive updates that move addresses. Asserts **every**
-  site before writing any, per-slice, with `--dry-run` / `--check` / `--resign`.
-- **resign.py** (in this folder) — `./resign.py <path> [--runtime]` signs a binary
-  or `.app` ad-hoc without the hardened runtime (the working default), then
-  verifies it.
 
 ## r2 cheat sheet
 
