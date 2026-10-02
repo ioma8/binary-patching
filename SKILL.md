@@ -96,9 +96,10 @@ audit trail that stops you re-testing the same guess.
   `RESSTR` indirection). `./find_refs.py <file> <0xADDR|name>... [--str <text>]`.
   Vectorized; catches the indirection a call scan cannot see.
 - **patch.py** (in this folder) — declarative applier. Manifest lines
-  `<arch> <va> <old_hex> <new_hex>`; asserts **every** site before writing any,
-  per-slice, with `--dry-run` / `--check` / `--resign <app>`. Replaces the
-  hand-written patcher and makes a patch re-applyable after an update.
+  `<arch> <site> <old_hex> <new_hex>`, where `<site>` is a VA or a **symbol
+  name** (`_..._GETSTATUS$$TSTATUS`, optional `+0xoff`); symbol sites survive
+  updates that move addresses. Asserts **every** site before writing any,
+  per-slice, with `--dry-run` / `--check` / `--resign <app>`.
 - **resign.py** (in this folder) — `./resign.py <path> [--runtime]` signs a binary
   or `.app` ad-hoc without the hardened runtime (the working default), then
   verifies it.
