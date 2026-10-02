@@ -21,7 +21,8 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = {n: os.path.join(HERE, n) for n in
-        ("fdis.py", "find_callers.py", "find_refs.py", "patch.py", "resign.py")}
+        ("fdis.py", "find_callers.py", "find_refs.py", "find_strings.py",
+         "patch.py", "resign.py")}
 FX = {}
 
 C_SRC = r"""
@@ -292,6 +293,34 @@ class TestFindRefs(unittest.TestCase):
     def test_x86_arch_mismatch_fails(self):
         r = run("find_refs.py", FX["x86"], "--arch", "arm64", hex(FX["x86_counter"]))
         self.assertNotEqual(r.returncode, 0)
+
+
+class TestFindStrings(unittest.TestCase):
+    def test_literal_with_va_then_refs(self):
+        """A discovered string VA feeds straight into find_refs."""
+        r = run("find_strings.py", FX["arm"], "%d", "--min", "2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        m = re.search(r"^([0-9a-f]+)\s+__cstring\s+%d", r.stdout, re.M)
+        self.assertIsNotNone(m, r.stdout)
+        refs = run("find_refs.py", FX["arm"], hex(int(m.group(1), 16)))
+        self.assertTrue(find_refs_sites(refs.stdout, "code"))
+
+    def test_section_filter(self):
+        c = run("find_strings.py", FX["arm"], "%d", "--min", "2", "--section", "__cstring")
+        d = run("find_strings.py", FX["arm"], "%d", "--min", "2", "--section", "__data")
+        self.assertIn("%d", c.stdout)
+        self.assertNotIn("%d", d.stdout)
+
+    def test_regex_and_count(self):
+        r = run("find_strings.py", FX["arm"], "--regex", "%.*", "--min", "2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("%d", r.stdout)
+        self.assertTrue(run("find_strings.py", FX["arm"], "--count").stdout.strip().isdigit())
+
+    def test_all_arches(self):
+        for arch, key in (("arm64", "arm"), ("x86_64", "x86"), ("x86", "i386")):
+            r = run("find_strings.py", FX[key], "--arch", arch)
+            self.assertEqual(r.returncode, 0, r.stderr)
 
 
 class TestPatch(unittest.TestCase):

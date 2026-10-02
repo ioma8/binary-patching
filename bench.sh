@@ -44,6 +44,11 @@ h "./find_refs.py $ARM $G_ARM" \
   "./find_refs.py $X86 --arch x86_64 $G_X86" \
   "./find_refs.py $I386 --arch x86 --no-code $G_I386"
 
+echo "=== find_strings: arm64 / x86_64 / i386 ==="
+h "./find_strings.py $ARM --min 8" \
+  "./find_strings.py $X86 --arch x86_64 --min 8" \
+  "./find_strings.py $I386 --arch x86 --min 2"
+
 echo "=== patch (dry-run, 3-arch fat object) ==="
 h "./patch.py $D/multi.o $D/m.patch --dry-run"
 

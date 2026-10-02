@@ -105,6 +105,10 @@ Per-tool usage and examples: `UTILS.md` (this folder).
   not per instruction; only i386 PIC refs through the GOT are missed). The
   pointer scan is pointer-width aware and works on every arch — it catches the
   indirection a call scan cannot.
+- **find_strings.py** (in this folder) — strings with their addresses: printable
+  runs in section contents (no symbol-table noise) with an unstrided VA and
+  section, so a string feeds straight into `find_refs.py`.
+  `./find_strings.py <file> [pattern] [--section S] [--min N] [--regex]`.
 - **patch.py** (in this folder) — declarative applier. Manifest lines
   `<arch> <site> <old_hex> <new_hex>` with `<arch>` = `arm64`/`x86_64`/`x86`/`*`,
   where `<site>` is a VA or a **symbol name** (`_..._GETSTATUS$$TSTATUS`, optional

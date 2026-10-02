@@ -78,6 +78,25 @@ arm64 code refs are exact; x86/x86_64 match the 32-bit displacement/immediate
 field vectorized (near-exact). On i386, PIC references through the GOT are not
 found.
 
+## find_strings.py — strings with their addresses
+
+```bash
+./find_strings.py <file> [pattern] [--arch ...] [--min N] [--section NAME]
+                  [--regex] [--all] [--count]
+```
+
+Lists printable strings with their virtual address and section, so a string can
+be handed straight to `find_refs.py` (or `fdis.py`). Scans section contents
+only, so symbol-table/relocation noise (`strings` over the whole file) is
+excluded, and skips instruction sections (`__text` &c.) unless `--all`.
+`--section` is repeatable; `--min` defaults to 4.
+
+```bash
+./find_strings.py BCompare "Trial"
+./find_strings.py BCompare --regex "Trial.*expire" --section __const
+./find_strings.py BCompare "LICENSE KEY" --count
+```
+
 ## patch.py — declarative applier
 
 ```bash
@@ -133,6 +152,6 @@ directories with `Contents/Info.plist` are signed `--deep`, then verified.
 ## Checks and benchmarks
 
 ```bash
-./test_utils.py    # 28 tests: builds a clang fixture, checks vs otool/nm/codesign
+./test_utils.py    # 32 tests: builds a clang fixture, checks vs otool/nm/codesign
 ./bench.sh         # hyperfine timings per arch (set BP_ARM/BP_X86/BP_I386 for big binaries)
 ```
