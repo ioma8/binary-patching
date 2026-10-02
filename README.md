@@ -27,6 +27,9 @@ Includes the tooling (`lldb`, `r2`, `nm`/`otool`, `lipo`, `codesign`, `osascript
 the hypothesis loop, and the arm64 encoding crib — all inline in
 [`SKILL.md`](SKILL.md).
 
+Ships two helpers: [`fdis.py`](fdis.py) — fast single-site disassembler — and
+[`find_callers.py`](find_callers.py) — vectorized caller finder.
+
 ## License
 
 MIT
