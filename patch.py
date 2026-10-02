@@ -183,7 +183,8 @@ def main() -> None:
         kind, a, *rest = parse_loc(loc)
         targets = sl if arch == "*" else [s for s in sl if s[0] == arch]
         if not targets:
-            print(f"  line {ln}: no {arch} slice present, skipping")
+            errors.append(f"line {ln}: no {arch} slice in this binary "
+                          f"({', '.join(s[0] for s in sl)})")
             continue
         for name, base, _size in targets:
             if kind == "va":

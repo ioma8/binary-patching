@@ -161,14 +161,14 @@ def code_refs(buf, text_va):
 
 
 def main() -> None:
-    arch, do_code, do_ptr, symbols_on = "arm64", True, True, True
+    arch, do_code, do_ptr, symbols_on, explicit = "arm64", True, True, True, False
     strs, pos, args, i = [], [], sys.argv[1:], 0
     while i < len(args):
         a = args[i]
         if a == "--arch":
-            arch, i = args[i + 1], i + 2
+            arch, explicit, i = args[i + 1], True, i + 2
         elif a.startswith("--arch="):
-            arch, i = a.split("=", 1)[1], i + 1
+            arch, explicit, i = a.split("=", 1)[1], True, i + 1
         elif a == "--str":
             strs.append(args[i + 1])
             i += 2
@@ -186,9 +186,13 @@ def main() -> None:
         raise SystemExit(1)
     path, target_args = pos[0], pos[1:]
 
-    want_cpu = {"arm64": CPU_ARM64, "x86_64": CPU_X86_64}[arch]
+    want_cpu = {"arm64": CPU_ARM64, "x86_64": CPU_X86_64}.get(arch)
+    if want_cpu is None:
+        raise SystemExit(f"unknown --arch {arch!r}; use arm64|x86_64")
     data = open(path, "rb").read()
     base, _size, cputype = pick_slice(data, want_cpu)
+    if explicit and cputype != want_cpu:
+        raise SystemExit(f"--arch {arch}: no {arch} slice in this thin binary")
     arch = "arm64" if cputype == CPU_ARM64 else "x86_64"
     if arch != "arm64" and do_code:
         raise SystemExit("code-ref scan is arm64-only; pass --no-code for x86_64")
@@ -281,15 +285,17 @@ def main() -> None:
 
     for s in strs:
         needle = s.encode()
-        found, p = 0, 0
+        found, seen_any, p = 0, False, 0
         while (p := data.find(needle, p)) >= 0:
+            seen_any = True
             va = fo_to_va(segs, p)
             if va is not None:
                 add(va, f'"{s}"', "string")
                 found += 1
             p += 1
         if not found:
-            raise SystemExit(f"string {s!r}: not found")
+            where = "only in non-data segments (no ref site)" if seen_any else "not found"
+            raise SystemExit(f"string {s!r}: {where}")
 
     # ---- scans ---------------------------------------------------------------
     ref_pc = ref_tgt = ref_kind = np.empty(0, np.int64)
@@ -301,13 +307,18 @@ def main() -> None:
     ptr_hits: dict[int, list[int]] = {}
     if do_ptr:
         tarr = np.array(sorted(seen), dtype=np.uint64)
+        # start of section data: the Mach-O header + load commands hold no pointers
+        hdr_end = base + 32 + struct.unpack_from("<I", data, base + 20)[0]
         for name, vmaddr, _vmsize, fileoff, filesize in segs:
-            if name in SKIP_SEGS or filesize < 8:
+            lo = max(fileoff, hdr_end)
+            avail = fileoff + filesize - lo
+            if name in SKIP_SEGS or avail < 8:
                 continue
-            words = np.frombuffer(data, "<u8", count=filesize // 8, offset=fileoff)
+            words = np.frombuffer(data, "<u8", count=avail // 8, offset=lo)
+            base_va = vmaddr + (lo - fileoff)
             sel = np.isin(words, tarr)
             for idx in np.flatnonzero(sel):
-                ptr_hits.setdefault(int(words[idx]), []).append(int(vmaddr + idx * 8))
+                ptr_hits.setdefault(int(words[idx]), []).append(int(base_va + idx * 8))
 
     # ---- report --------------------------------------------------------------
     for va, label, origin in tgt:

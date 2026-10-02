@@ -16,7 +16,10 @@ lazily, so a 56 MB slice resolves callers in ~10 ms.
 Columns: `call_site  caller_symbol+offset`.
 
 Misses: indirect calls (PLT/GOT/vtable, x86 `call [..]`), arm64 tail-calls (`B`),
-and calls in the other architecture slice. Run `fdis.py` to read a site.
+and calls in the other architecture slice. arm64 is exact (BL is a fixed-width,
+word-aligned opcode). The x86_64 scan keys off the `0xE8` opcode byte and is a
+heuristic: it finds every real direct call, but can add a spurious caller (on
+/bin/ls, 4 of 23 targets gained one). Run `fdis.py` to read a site.
 """
 import struct
 import sys
@@ -98,13 +101,13 @@ def call_sites(buf: "np.ndarray", arch: str, text_va: int):
 
 
 def main() -> None:
-    arch, symbols_on, pos, args, i = "arm64", True, [], sys.argv[1:], 0
+    arch, symbols_on, explicit, pos, args, i = "arm64", True, False, [], sys.argv[1:], 0
     while i < len(args):
         a = args[i]
         if a == "--arch":
-            arch, i = args[i + 1], i + 2
+            arch, explicit, i = args[i + 1], True, i + 2
         elif a.startswith("--arch="):
-            arch, i = a.split("=", 1)[1], i + 1
+            arch, explicit, i = a.split("=", 1)[1], True, i + 1
         elif a == "--no-symbols":
             symbols_on, i = False, i + 1
         else:
@@ -115,9 +118,13 @@ def main() -> None:
         raise SystemExit(1)
     path, target_args = pos[0], pos[1:]
 
-    want_cpu = {"arm64": CPU_ARM64, "x86_64": CPU_X86_64}[arch]
+    want_cpu = {"arm64": CPU_ARM64, "x86_64": CPU_X86_64}.get(arch)
+    if want_cpu is None:
+        raise SystemExit(f"unknown --arch {arch!r}; use arm64|x86_64")
     data = open(path, "rb").read()
     base, _size, cputype = pick_slice(data, want_cpu)
+    if explicit and cputype != want_cpu:
+        raise SystemExit(f"--arch {arch}: no {arch} slice in this thin binary")
     arch = "arm64" if cputype == CPU_ARM64 else "x86_64"
 
     text, symtab = load_commands(data, base)

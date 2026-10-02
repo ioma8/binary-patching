@@ -24,6 +24,11 @@ LC_SEGMENT_64 = 0x19
 
 def read_slice(path: str) -> bytes:
     data = open(path, "rb").read()
+    if struct.unpack("<I", data[:4])[0] == MH_MAGIC_64:          # thin
+        cpu = struct.unpack("<I", data[4:8])[0]
+        if cpu != CPU_TYPE_ARM64:                                # arm64e shares this cpu type
+            raise SystemExit(f"fdis.py is arm64-only; {path} is cputype {cpu:#x}")
+        return data
     magic = struct.unpack(">I", data[:4])[0]
     if magic in (FAT_MAGIC, FAT_MAGIC_64):
         nfat = struct.unpack(">I", data[4:8])[0]
@@ -39,7 +44,7 @@ def read_slice(path: str) -> bytes:
             if cputype == CPU_TYPE_ARM64:
                 return data[offset:offset + size]
         raise SystemExit("no arm64 slice in fat binary")
-    return data
+    raise SystemExit("not a Mach-O / fat Mach-O")
 
 
 def segments(data: bytes):
