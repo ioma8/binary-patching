@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Benchmark every helper with hyperfine, per architecture (arm64/x86_64/i386).
+# Benchmark every helper with hyperfine, per architecture (arm64/x86_64/i386)
+# and container (Mach-O and, if mingw-w64 is present, PE).
 #
 # Builds small real fixtures with clang. For scan-bound numbers, point
 # BP_ARM / BP_X86 / BP_I386 at larger binaries (addresses are read from nm) and
@@ -54,3 +55,16 @@ h "./patch.py $D/multi.o $D/m.patch --dry-run"
 
 echo "=== resign (ad-hoc) ==="
 h --prepare "cp $ARM $D/rg.bin" "./resign.py $D/rg.bin --no-verify"
+
+if command -v x86_64-w64-mingw32-gcc >/dev/null && command -v i686-w64-mingw32-gcc >/dev/null; then
+  x86_64-w64-mingw32-gcc -O0 -o "$D/pe64.exe" "$D/fx.c"
+  i686-w64-mingw32-gcc   -O0 -o "$D/pe32.exe" "$D/fx.c"
+  P64=$(x86_64-w64-mingw32-nm "$D/pe64.exe" | awk '$3=="target_fn"{print "0x"$1; exit}')
+  Q32=$(i686-w64-mingw32-nm "$D/pe32.exe" | awk '$3=="_target_fn"{print "0x"$1; exit}')
+  G64=$(x86_64-w64-mingw32-nm "$D/pe64.exe" | awk '$3=="g_counter"{print "0x"$1; exit}')
+  echo "=== PE (mingw, x86_64 / i386) ==="
+  h "./fdis.py $D/pe64.exe $P64 20" "./fdis.py $D/pe32.exe $Q32 20 --arch x86"
+  h "./find_callers.py $D/pe64.exe target_fn" "./find_callers.py $D/pe32.exe --arch x86 target_fn"
+  h "./find_refs.py $D/pe64.exe $G64" "./find_refs.py $D/pe32.exe --arch x86 --no-code $G64"
+  h "./find_strings.py $D/pe64.exe --min 8 --count"
+fi

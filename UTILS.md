@@ -1,16 +1,17 @@
 # Utilities
 
-Standalone helpers for reverse-engineering and patching Mach-O binaries, on
-**arm64, x86_64 and i386**. Each is a single `uv` script with inline
-dependencies — run it directly (`./fdis.py ...`); the first run builds its
-environment, later runs are fast.
+Standalone helpers for reverse-engineering and patching **Mach-O and PE**
+binaries, on **arm64, x86_64 and i386**. Each is a single `uv` script with
+inline dependencies — run it directly (`./fdis.py ...`); the first run builds
+its environment, later runs are fast.
 
 **Conventions**
 
-- `<arch>` is `arm64`, `x86_64` or `x86` (i386). It selects the slice of a fat
-  binary; a thin binary is auto-detected. Default: `arm64`.
-- Addresses are **unslid virtual addresses**, exactly as `nm` prints them
-  (for `__TEXT` in a plain executable, VA − `0x100000000` = file offset).
+- The container (Mach-O thin/fat, or PE32/PE32+) is detected automatically;
+  `--arch` selects the slice of a fat Mach-O.
+- `<arch>` is `arm64`, `x86_64` or `x86` (i386).
+- Addresses are **virtual addresses** — for Mach-O exactly as `nm` prints them,
+  for PE the `ImageBase + RVA` that `objdump` / `nm` print.
 - `./test_utils.py` checks every tool against `otool` / `nm` / `codesign`
   ground truth; `./bench.sh` benchmarks them with
   [hyperfine](https://github.com/sharkdp/hyperfine).
@@ -146,6 +147,9 @@ directories with `Contents/Info.plist` are signed `--deep`, then verified.
 ./resign.py "My App.app"
 ./resign.py MyBinary --runtime --identity "Developer ID Application: ..."
 ```
+
+Mach-O only (`codesign`); it refuses a PE image — Authenticode signing needs
+`signtool` / `osslsigncode`.
 
 ---
 

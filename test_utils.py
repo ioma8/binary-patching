@@ -57,12 +57,23 @@ def otool_tv(path):
     return rows
 
 
-def nm_sym(path, name):
-    for line in subprocess.run(["nm", path], capture_output=True, text=True).stdout.splitlines():
+def nm_sym(path, name, nm="nm"):
+    for line in subprocess.run([nm, path], capture_output=True, text=True).stdout.splitlines():
         f = line.split()
         if len(f) == 3 and f[2] == name:
             return int(f[0], 16)
     return None
+
+
+def objdump_call_sites(path, target_va, objdump):
+    """PE ground truth: direct call sites of target_va."""
+    out = subprocess.run([objdump, "-d", path], capture_output=True, text=True).stdout
+    sites = set()
+    for line in out.splitlines():
+        m = re.match(r"\s*([0-9a-f]+):\t[0-9a-f ]+\tcall\s+([0-9a-f]+)", line)
+        if m and int(m.group(2), 16) == target_va:
+            sites.add(int(m.group(1), 16))
+    return sites
 
 
 def arm_calls_to(path, symname):
@@ -173,6 +184,17 @@ def setUpModule():
         FX[f"{key}_counter"] = nm_sym(FX[key], "_g_counter")
     FX["i386_target"] = nm_sym(FX["i386"], "_target_fn")
     FX["i386_counter"] = nm_sym(FX["i386"], "_g_counter")
+
+    # PE fixtures (mingw-w64 is optional; PE tests skip without it)
+    m64, m32 = shutil.which("x86_64-w64-mingw32-gcc"), shutil.which("i686-w64-mingw32-gcc")
+    FX["mingw"] = bool(m64 and m32 and shutil.which("x86_64-w64-mingw32-objdump"))
+    if FX["mingw"]:
+        subprocess.run([m64, "-O0", "-o", os.path.join(d, "pe64.exe"), src], check=True)
+        subprocess.run([m32, "-O0", "-o", os.path.join(d, "pe32.exe"), src], check=True)
+        FX.update(pe64=os.path.join(d, "pe64.exe"), pe32=os.path.join(d, "pe32.exe"))
+        FX["pe64_target"] = nm_sym(FX["pe64"], "target_fn", "x86_64-w64-mingw32-nm")
+        FX["pe32_target"] = nm_sym(FX["pe32"], "_target_fn", "i686-w64-mingw32-nm")
+        FX["pe64_counter"] = nm_sym(FX["pe64"], "g_counter", "x86_64-w64-mingw32-nm")
 
 
 def tearDownModule():
@@ -397,6 +419,61 @@ class TestPatch(unittest.TestCase):
         r = run("patch.py", tgt, m)
         self.assertEqual(r.returncode, 0, r.stdout)
         self.assertIn("2 site(s)", r.stdout)
+
+
+class TestPE(unittest.TestCase):
+    def setUp(self):
+        if not FX.get("mingw"):
+            self.skipTest("mingw-w64 not installed")
+        self.tmp = tempfile.mkdtemp(prefix="bpatch-pe-")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_fdis_x64_and_x86(self):
+        r = run("fdis.py", FX["pe64"], hex(FX["pe64_target"]), "3")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("push", r.stdout)
+        r = run("fdis.py", FX["pe32"], hex(FX["pe32_target"]), "3", "--arch", "x86")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("push", r.stdout)
+
+    def test_find_callers_matches_objdump(self):
+        expect64 = objdump_call_sites(FX["pe64"], FX["pe64_target"],
+                                      "x86_64-w64-mingw32-objdump")
+        self.assertEqual(len(expect64), 2)
+        r = run("find_callers.py", FX["pe64"], "target_fn")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(find_callers_sites(r.stdout), expect64)
+        expect32 = objdump_call_sites(FX["pe32"], FX["pe32_target"],
+                                      "i686-w64-mingw32-objdump")
+        r = run("find_callers.py", FX["pe32"], "--arch", "x86", "target_fn")
+        self.assertEqual(find_callers_sites(r.stdout), expect32)
+
+    def test_find_refs_and_strings(self):
+        r = run("find_refs.py", FX["pe64"], "--no-ptr", "g_counter")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(find_refs_sites(r.stdout, "code")), 5)
+        s = run("find_strings.py", FX["pe64"], "%d", "--min", "2")
+        self.assertEqual(s.returncode, 0, s.stderr)
+        m = re.search(r"^([0-9a-f]+)\s+\.rdata\s+%d", s.stdout, re.M)
+        self.assertIsNotNone(m, s.stdout)
+        refs = run("find_refs.py", FX["pe64"], hex(int(m.group(1), 16)))
+        self.assertTrue(find_refs_sites(refs.stdout, "code"))
+
+    def test_patch_symbol_round_trip(self):
+        dst = os.path.join(self.tmp, "pe.exe")
+        shutil.copy(FX["pe64"], dst)
+        mf = os.path.join(self.tmp, "m.patch")
+        with open(mf, "w") as f:
+            f.write("x86_64 target_fn - c3\n")
+        self.assertEqual(run("patch.py", dst, mf).returncode, 0)
+        self.assertEqual(run("patch.py", dst, mf, "--check").returncode, 0)
+
+    def test_resign_refuses_pe(self):
+        r = run("resign.py", FX["pe64"], "--no-verify")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("macOS-only", r.stdout + r.stderr)
 
 
 class TestResign(unittest.TestCase):

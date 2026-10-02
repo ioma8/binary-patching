@@ -5,111 +5,45 @@
 # ///
 """patch.py <file> <manifest> [--dry-run] [--check] [--resign <app>]
 
-Apply a declarative patch manifest to a Mach-O binary, per architecture slice,
-asserting the pristine bytes at every site before writing any of them.
+Apply a declarative patch manifest to a Mach-O **or PE** binary, asserting the
+pristine bytes at every site before writing any of them.
 
 Manifest: one site per line, `<arch> <site> <old_hex> <new_hex>  # comment`
-  arch    arm64 | x86_64 | x86 | *   (* = every slice)
-  site    a virtual address (`0x1000d7740`) or a symbol name from the symbol
-          table, optionally `+0xoff` (e.g. `_BCLOCK..._GETSTATUS$$TSTATUS`).
-          Symbol sites survive app updates that move the addresses.
+  arch    arm64 | x86_64 | x86 | *   (* = every architecture present)
+  site    a virtual address (`0x1000d7740`) or an exact symbol name, optional
+          `+0xoff`. Symbol sites survive updates that move addresses.
   old_hex expected bytes (asserted; `-` to skip)
   new_hex replacement bytes (must be the same length as old_hex)
 
 All sites are verified first; if any assert fails, nothing is written.
   --dry-run        verify only, never write
   --check          verify the NEW bytes are already present (is it patched?)
-  --resign <app>   re-sign with resign.py afterwards
+  --resign <app>   re-sign with resign.py afterwards (Mach-O only)
 
 Example manifest:
-  arm64  0x1000d7740 fd7bbfa9fd030091 60008052c0035fd6   # by address
+  arm64  0x1000d7740 fd7bbfa9fd030091 60008052c0035fd6       # by address
   x86_64 0x1000d17a0 554889e5488d b803000000c3            # by address
-  arm64  _CERTDECODE$_$TCERTDECODER_$__$$_GETSTATUS$$TSTATUS fd7bbfa9fd030091 60008052c0035fd6  # by symbol
+  arm64  _CERTDECODE$_$TCERTDECODER_$__$$_GETSTATUS$$TSTATUS - c0035fd6
 """
 import os
 import struct
 import subprocess
 import sys
 
-FAT_MAGIC = 0xCAFEBABE
-FAT_MAGIC_64 = 0xCAFEBABF
-MH_MAGIC = 0xFEEDFACE
-MH_MAGIC_64 = 0xFEEDFACF
-CPU_NAMES = {0x0100000C: "arm64", 0x01000007: "x86_64", 0x00000007: "x86"}
-LC_SEGMENT = 0x01
-LC_SEGMENT_64 = 0x19
-LC_SYMTAB = 0x02
+import binfmt
 
 
-def slice_list(data: bytes):
-    """[(arch_name, base_fileoff, size)] for every slice."""
-    if struct.unpack("<I", data[:4])[0] in (MH_MAGIC, MH_MAGIC_64):
-        cpu = struct.unpack("<I", data[4:8])[0]
-        return [(CPU_NAMES.get(cpu, hex(cpu)), 0, len(data))]
-    magic = struct.unpack(">I", data[:4])[0]
-    if magic not in (FAT_MAGIC, FAT_MAGIC_64):
-        raise SystemExit("not a Mach-O / fat Mach-O")
-    out, off = [], 8
-    for _ in range(struct.unpack(">I", data[4:8])[0]):
-        if magic == FAT_MAGIC_64:
-            cputype = struct.unpack(">I", data[off:off + 4])[0]
-            offset, size = struct.unpack(">QQ", data[off + 8:off + 24])
-            off += 32
-        else:
-            cputype = struct.unpack(">I", data[off:off + 4])[0]
-            offset, size = struct.unpack(">II", data[off + 8:off + 16])
-            off += 20
-        out.append((CPU_NAMES.get(cputype, hex(cputype)), offset, size))
-    return out
+def lookup_symbol(data: bytes, base: int, is64: bool, st, name: str):
+    """Mach-O: unslid VA of an exact, defined symbol name, or None.
 
-
-def segments(data: bytes, base: int, is64: bool):
-    """[(name, vmaddr, vmsize, abs_fileoff, filesize)] for one slice."""
-    ncmds = struct.unpack_from("<I", data, base + 16)[0]
-    off, segs = base + (32 if is64 else 28), []
-    for _ in range(ncmds):
-        cmd, cmdsize = struct.unpack_from("<II", data, off)
-        if cmd == (LC_SEGMENT_64 if is64 else LC_SEGMENT):
-            name = data[off + 8:off + 24].split(b"\0", 1)[0].decode()
-            vmaddr, vmsize, fileoff, filesize = struct.unpack_from(
-                "<QQQQ" if is64 else "<IIII", data, off + 24)
-            segs.append((name, vmaddr, vmsize, base + fileoff, filesize))
-        off += cmdsize
-    return segs
-
-
-def va_to_abs(segs, va: int):
-    for _name, vmaddr, vmsize, fileoff, filesize in segs:
-        if vmaddr <= va < vmaddr + vmsize:
-            rel = va - vmaddr
-            return fileoff + rel if rel < filesize else None
-    return None
-
-
-def symtab(data: bytes, base: int, is64: bool):
-    """(abs_symoff, nsyms, abs_stroff, strsize) for one slice, or None."""
-    ncmds = struct.unpack_from("<I", data, base + 16)[0]
-    off = base + (32 if is64 else 28)
-    for _ in range(ncmds):
-        cmd, cmdsize = struct.unpack_from("<II", data, off)
-        if cmd == LC_SYMTAB:
-            symoff, nsyms, stroff, strsize = struct.unpack_from("<IIII", data, off + 8)
-            return base + symoff, nsyms, base + stroff, strsize
-        off += cmdsize
-    return None
-
-
-def lookup_symbol(data: bytes, st, name: str, is64: bool):
-    """Unslid VA of `name` (exact match, a defined N_SECT symbol), or None.
-
-    Finds the name in the string table, then the nlist entry whose n_strx
-    points at it — a couple of C-speed byte scans, no per-symbol Python loop.
-    A defined symbol may legitimately sit at address 0 (object files).
+    Finds the name in the string table, then the nlist entry whose n_strx points
+    at it — a couple of C-speed byte scans, no per-symbol Python loop.
     """
     if st is None:
         return None
     symoff, nsyms, stroff, strsize = st
     esz, vsz = (16, 8) if is64 else (12, 4)
+    symoff, stroff = base + symoff, base + stroff
     want, end = name.encode(), stroff + strsize
     p = data.find(want, stroff, end)
     while p >= 0:
@@ -125,6 +59,12 @@ def lookup_symbol(data: bytes, st, name: str, is64: bool):
                 s = q + 1
         p = data.find(want, p + 1, end)
     return None
+
+
+def exact_symbol(img, data, name: str):
+    if img.fmt == "pe":
+        return next((v for n, v in img.pe_syms if n == name), None)
+    return lookup_symbol(data, img.base, img.is64, img.symtab, name)
 
 
 def parse_loc(loc: str):
@@ -178,34 +118,33 @@ def main() -> None:
         raise SystemExit(1)
     path, manifest = pos
     data = bytearray(open(path, "rb").read())
-    sl = slice_list(data)
-    is64_of = {name: struct.unpack("<I", data[base:base + 4])[0] == MH_MAGIC_64
-               for name, base, _s in sl}
-    seg_cache = {name: segments(data, base, is64_of[name]) for name, base, _s in sl}
+    present = binfmt.arches(path)
+    if not present:
+        raise SystemExit("not a Mach-O or PE file")
+    images = {a: binfmt.load(path, a) for a in present}
+    if resign and any(im.fmt == "pe" for im in images.values()):
+        raise SystemExit("--resign: PE Authenticode needs signtool/osslsigncode, "
+                         "not codesign (resign.py is macOS-only)")
 
     actions, errors = [], []
-    sym_cache: dict[str, object] = {}
     for ln, arch, loc, old, new in parse_manifest(open(manifest).read()):
         kind, a, *rest = parse_loc(loc)
-        targets = sl if arch == "*" else [s for s in sl if s[0] == arch]
-        if not targets:
-            errors.append(f"line {ln}: no {arch} slice in this binary "
-                          f"({', '.join(s[0] for s in sl)})")
+        if arch != "*" and arch not in present:
+            errors.append(f"line {ln}: no {arch} image in this file ({', '.join(present)})")
             continue
-        for name, base, _size in targets:
+        for name in (present if arch == "*" else [arch]):
+            img = images[name]
             if kind == "va":
                 va = a
             else:
-                if name not in sym_cache:
-                    sym_cache[name] = symtab(data, base, is64_of[name])
-                va = lookup_symbol(data, sym_cache[name], a, is64_of[name])
+                va = exact_symbol(img, data, a)
                 if va is None:
-                    errors.append(f"line {ln}: symbol {a!r} not found in {name} slice")
+                    errors.append(f"line {ln}: symbol {a!r} not found in {name}")
                     continue
                 va += rest[0]
-            fo = va_to_abs(seg_cache[name], va)
+            fo = img.va_to_off(va)
             if fo is None or fo + len(new) > len(data):
-                errors.append(f"line {ln}: {loc} -> {va:#x} not mapped in {name} slice")
+                errors.append(f"line {ln}: {loc} -> {va:#x} not mapped in {name}")
                 continue
             cur = bytes(data[fo:fo + len(new)])
             want = new if check else (old if old is not None else cur)

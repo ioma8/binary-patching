@@ -19,12 +19,12 @@ The method — a six-step loop (ground truth → classify → trace backward →
 the split point → minimal patch → verify 3×), the hypothesis loop, the blind
 routes, and the arm64 encoding crib — lives in [`SKILL.md`](SKILL.md).
 
-Ships six fast helpers for **arm64, x86_64 and i386** Mach-O binaries:
+Ships six fast helpers for **arm64 / x86_64 / i386**, in **Mach-O and PE**:
 [`fdis.py`](fdis.py) — disassembler; [`find_callers.py`](find_callers.py) /
 [`find_refs.py`](find_refs.py) / [`find_strings.py`](find_strings.py) — callers,
 references and strings with their addresses; [`patch.py`](patch.py) —
 declarative, all-or-nothing applier; [`resign.py`](resign.py) — ad-hoc
-re-signer. Usage: [`UTILS.md`](UTILS.md).
+re-signer (Mach-O only). Usage: [`UTILS.md`](UTILS.md).
 
 ```bash
 ./test_utils.py    # 32 tests vs otool / nm / codesign ground truth

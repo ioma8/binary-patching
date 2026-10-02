@@ -66,13 +66,14 @@ audit trail that stops you re-testing the same guess.
 
 **Reach for the in-folder helpers first.** They are self-contained, super fast
 (a 50 MB slice answers in well under half a second — 0.06–0.25 s measured — and
-milliseconds on a small file) and one command each — no `aaa`, no whole-`__TEXT`
-dump, no flag archaeology. Only drop to `r2` / `otool` / `lldb` for what they
+milliseconds on a small file), one command each, and work on **Mach-O and PE**
+across **arm64 / x86_64 / i386** — no `aaa`, no whole-`__TEXT`/`.text` dump, no
+flag archaeology. Only drop to `r2` / `otool` / `objdump` / `lldb` for what they
 deliberately do not do: CFG/structural queries, `wx`, dynamic tracing. Usage and
 examples: `UTILS.md`.
 
-- **fdis.py** — disassembler for **arm64 / x86_64 / i386**:
-  `./fdis.py <file> <addr> [n] [--arch arm64|x86_64|x86]` prints
+- **fdis.py** — disassembler for **arm64 / x86_64 / i386** in Mach-O and PE:
+  `./fdis.py <file> <addr> [n] [--arch ...]` prints
   `vmaddr fileoff bytes mnemonic operands` by seeking straight to the address —
   one round trip, milliseconds — instead of dumping the whole `__TEXT` like
   `otool` (~510 ms) or r2 `pd` (~380 ms).
@@ -99,9 +100,9 @@ examples: `UTILS.md`.
   (symbol sites survive updates that move addresses).
   `--dry-run` / `--check` / `--resign`.
 - **resign.py** — `./resign.py <path> [--runtime]`: ad-hoc sign without the
-  hardened runtime (the working default), then verify.
+  hardened runtime (the working default), then verify. Mach-O only.
 
-External tools, as fallbacks:
+External tools, as fallbacks (examples are `otool`-flavoured; use `objdump` for PE):
 
 - **nm / otool — symbols are the map.** Survey first: an unstripped build names
   the domain (`CHECK*`, `LOAD*`, `IS*`, `Get*`); if symbols exist most of the job

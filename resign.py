@@ -42,6 +42,9 @@ def main() -> None:
     path = pos[0]
     if not os.path.exists(path):
         raise SystemExit(f"no such path: {path}")
+    if os.path.isfile(path) and open(path, "rb").read(2) == b"MZ":
+        raise SystemExit("resign.py is macOS-only (codesign); PE Authenticode "
+                         "signing needs signtool / osslsigncode")
     is_bundle = path.endswith(".app") or os.path.exists(
         os.path.join(path, "Contents", "Info.plist"))
 
