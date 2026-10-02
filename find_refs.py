@@ -14,8 +14,8 @@ Find references to an address, symbol, or string in a Mach-O binary.
          RESSTR indirection (things a code scan cannot see)
 
 Targets are `0xADDR` or a symbol-name substring. `--str <text>` locates a string
-literal first, then reports references to it. Vectorized (NumPy); ~10–30 ms on a
-56 MB slice.
+literal first, then reports references to it. Vectorized (NumPy): the scan is
+~15 ms on a 56 MB slice, ~0.1 s wall (dominated by interpreter + NumPy import).
 
 Columns: `kind  va  detail`.
 
@@ -102,60 +102,62 @@ def fo_to_va(segs, fo):
     return None
 
 
-def lookahead(arr, k):
-    out = np.zeros_like(arr)
-    if k < arr.size:
-        out[: arr.size - k] = arr[k:]
-    return out
-
-
 def code_refs(buf, text_va):
     """(ref_pc, target, kind_code) for every adrp-paired or adr address."""
     n = len(buf) // 4
     w = buf[: n * 4].view("<u4")
-    pc = text_va + np.arange(n, dtype=np.int64) * 4
+    top = w & 0x9F000000                                     # shared by adrp/adr
+    pcs, tgts, kinds = [], [], []
 
-    # adrp: op=1, bits[28:24]=10000
-    is_adrp = (w & 0x9F000000) == 0x90000000
-    imm = (((w >> 5) & 0x7FFFF) << 2 | ((w >> 29) & 0x3)).astype(np.int64)
-    imm = (imm ^ 0x100000) - 0x100000                       # sign-extend 21-bit
-    page = (pc & ~0xFFF) + (imm << 12)
-    rd = (w & 0x1F).astype(np.int64)
+    A = np.flatnonzero(top == 0x90000000)                     # adrp
+    if A.size:
+        wa = w[A]
+        imm = (((wa >> 5) & 0x7FFFF) << 2 | ((wa >> 29) & 0x3)).astype(np.int64)
+        imm = (imm ^ 0x100000) - 0x100000                     # sign-extend 21-bit
+        page = ((text_va + A.astype(np.int64) * 4) & ~0xFFF) + (imm << 12)
+        rd = (wa & 0x1F).astype(np.int64)
+        for k in (1, 2, 3):
+            B = A + k
+            B = B[B < n]                                      # prefix of A+k
+            if B.size == 0:
+                break
+            wb = w[B]
+            sel = ((wb >> 5) & 0x1F).astype(np.int64) == rd[: B.size]
+            if not sel.any():
+                continue
+            nb, wb, pg = B[sel], wb[sel], page[: B.size][sel]
+            im = ((wb >> 10) & 0xFFF).astype(np.int64)
+            ref = text_va + nb.astype(np.int64) * 4
+            add = (wb & 0xFF800000) == 0x91000000
+            if add.any():
+                off = im[add] << (((wb[add] >> 22) & 0x3).astype(np.int64) * 12)
+                pcs.append(ref[add])
+                tgts.append(pg[add] + off)
+                kinds.append(np.zeros(int(add.sum()), np.int64))
+            for code, mask, sh in ((1, (wb & 0xFFC00000) == 0xF9400000, 3),
+                                   (2, (wb & 0xFFC00000) == 0xF9000000, 3),
+                                   (3, (wb & 0xFFC00000) == 0xB9400000, 2),
+                                   (4, (wb & 0xFFC00000) == 0xB9000000, 2)):
+                if mask.any():
+                    pcs.append(ref[mask])
+                    tgts.append(pg[mask] + (im[mask] << sh))
+                    kinds.append(np.full(int(mask.sum()), code, np.int64))
 
-    # memory operands that use one register as base
-    add = (w & 0xFF800000) == 0x91000000
-    add_ok = add & (((w >> 5) & 0x1F) == (w & 0x1F))         # add xD, xD, #imm
-    l64 = (w & 0xFFC00000) == 0xF9400000
-    s64 = (w & 0xFFC00000) == 0xF9000000
-    l32 = (w & 0xFFC00000) == 0xB9400000
-    s32 = (w & 0xFFC00000) == 0xB9000000
-    scale = add_ok.astype(np.int64) * (1 << (((w >> 22) & 0x3) * 12)) \
-        + l64 * 8 + s64 * 8 + l32 * 4 + s32 * 4
-    kind = (add_ok * 0 + l64 * 1 + s64 * 2 + l32 * 3 + s32 * 4)
-    mem = add_ok | l64 | s64 | l32 | s32
-    base = ((w >> 5) & 0x1F).astype(np.int64)                  # Rn
-    off = (((w >> 10) & 0xFFF).astype(np.int64)) * scale
+    D = np.flatnonzero(top == 0x10000000)                     # adr
+    if D.size:
+        wd = w[D]
+        aimm = (((wd >> 5) & 0x7FFFF) << 2 | ((wd >> 29) & 0x3)).astype(np.int64)
+        aimm = (aimm ^ 0x100000) - 0x100000
+        pcd = text_va + D.astype(np.int64) * 4
+        pcs.append(pcd)
+        tgts.append(pcd + aimm)
+        kinds.append(np.full(D.size, 5, np.int64))
 
-    out_pc, out_tgt, out_kind = [], [], []
-    for k in (1, 2, 3):
-        m = is_adrp & lookahead(mem, k) & (rd == lookahead(base, k))
-        if m.any():
-            out_pc.append(pc[m])
-            out_tgt.append(page[m] + lookahead(off, k)[m])
-            out_kind.append(lookahead(kind, k)[m])
-    # adr: op=0, bits[28:24]=10000
-    is_adr = (w & 0x9F000000) == 0x10000000
-    aimm = (((w >> 5) & 0x7FFFF) << 2 | ((w >> 29) & 0x3)).astype(np.int64)
-    aimm = (aimm ^ 0x100000) - 0x100000
-    if is_adr.any():
-        out_pc.append(pc[is_adr])
-        out_tgt.append(pc[is_adr] + aimm[is_adr])
-        out_kind.append(np.full(int(is_adr.sum()), 5, np.int64))
-    if not out_pc:
+    if not pcs:
         z = np.empty(0, np.int64)
         return z, z, z
-    return (np.concatenate(out_pc), np.concatenate(out_tgt),
-            np.concatenate(out_kind).astype(np.int64))
+    return (np.concatenate(pcs), np.concatenate(tgts),
+            np.concatenate(kinds).astype(np.int64))
 
 
 def main() -> None:
@@ -198,13 +200,21 @@ def main() -> None:
     name_cache: dict[int, str] = {}
     sym_strbase = 0
     kstrx = kva = np.empty(0, np.int64)
-    sym_va = sym_strx = uniq_strx = np.empty(0, np.int64)
+    sym_va = sym_strx = np.empty(0, np.int64)
+    all_strx = None
+    _uniq: list = []
 
     def name_at(strx: int) -> str:
         if strx not in name_cache:
             o = sym_strbase + strx
             name_cache[strx] = data[o:data.index(b"\0", o)].decode("utf-8", "replace")
         return name_cache[strx]
+
+    def name_starts():
+        if not _uniq:                                    # built only for a name query
+            _uniq.append(np.unique(all_strx) if all_strx is not None and all_strx.size
+                         else np.empty(0, np.uint32))
+        return _uniq[0]
 
     if symbols_on and symtab is not None:
         symoff, nsyms, stroff, _ss = symtab
@@ -215,9 +225,12 @@ def main() -> None:
         sel = np.flatnonzero(keep)
         kstrx = arr["n_strx"][sel].astype(np.int64)
         kva = arr["n_value"][sel].astype(np.int64)
-        order = np.argsort(kva, kind="stable")
-        sym_va, sym_strx = kva[order], kstrx[order]
-        uniq_strx = np.unique(arr["n_strx"])
+        all_strx = arr["n_strx"]
+        if kva.size and np.all(np.diff(kva) >= 0):
+            sym_va, sym_strx = kva, kstrx                # table already address-ordered
+        elif kva.size:
+            order = np.argsort(kva, kind="stable")
+            sym_va, sym_strx = kva[order], kstrx[order]
 
     def label_for(va: int) -> str:
         if sym_va.size == 0:
@@ -258,8 +271,9 @@ def main() -> None:
             p += 1
         before = len(tgt)
         if hits:
-            j = np.searchsorted(uniq_strx, np.array(hits), "right") - 1
-            for strx in np.unique(uniq_strx[j[j >= 0]]):
+            uniq = name_starts()
+            j = np.searchsorted(uniq, np.array(hits), "right") - 1
+            for strx in np.unique(uniq[j[j >= 0]]):
                 for si in np.flatnonzero(kstrx == strx):
                     add(int(kva[si]), name_at(int(strx)), "symbol")
         if len(tgt) == before:
