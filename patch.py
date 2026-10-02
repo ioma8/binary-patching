@@ -22,9 +22,9 @@ All sites are verified first; if any assert fails, nothing is written.
   --resign <app>   re-sign with resign.py afterwards
 
 Example manifest:
-  arm64 0x1000d7740 fd7bbfa9fd030091 60008052c0035fd6       # by address
-  arm64 _..._GETSTATUS$$TSTATUS fd7bbfa9fd030091 60008052c0035fd6  # by symbol
-  x86_64 0x000d17a0 554889e5488d6424f0 b803000000c3      # by address
+  arm64  0x1000d7740 fd7bbfa9fd030091 60008052c0035fd6   # by address
+  x86_64 0x1000d17a0 554889e5488d b803000000c3            # by address
+  arm64  _CERTDECODE$_$TCERTDECODER_$__$$_GETSTATUS$$TSTATUS fd7bbfa9fd030091 60008052c0035fd6  # by symbol
 """
 import os
 import struct
