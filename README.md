@@ -35,8 +35,9 @@ patch applier (address- or symbol-addressed); and [`resign.py`](resign.py) —
 ad-hoc re-signer.
 
 Run [`test_utils.py`](test_utils.py) to check them: it builds a C fixture with
-clang (arm64, x86_64, fat) and validates every tool against `otool` / `nm` /
-`codesign` ground truth.
+clang (arm64, x86_64, i386, fat) and validates every tool against `otool` /
+`nm` / `codesign` ground truth. [`bench.sh`](bench.sh) benchmarks each helper
+per architecture with [hyperfine](https://github.com/sharkdp/hyperfine).
 
 ## License
 

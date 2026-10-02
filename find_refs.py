@@ -9,10 +9,10 @@
 Find references to an address, symbol, or string in a Mach-O binary (arm64,
 x86_64, i386).
 
-  code — instructions that materialize/access the address. arm64: `adrp+add`,
-         `adrp+ldr/str`, `adr` (exact). x86_64: RIP-relative operands. i386:
-         absolute operands. (x86 code refs need a disassembler and are best
-         effort — see the note below.)
+  code — instructions that access the address. arm64: `adrp+add`,
+         `adrp+ldr/str`, `adr` (exact). x86_64: RIP-relative; i386: absolute.
+         Found by matching the 32-bit displacement/immediate field vectorized
+         (near-exact: ~1 in 4e9 windows is coincidence).
   ptr  — pointer-sized values equal to the address: vtables, dispatch tables,
          RESSTR indirection (things the code scan cannot see).
 
@@ -22,9 +22,9 @@ literal first, then reports references to it.
 Columns: `kind  va  detail`.
 
 Misses: references computed at runtime; unaligned pointers; the other arch
-slice; and, for x86, code references that a linear/disassembler sweep cannot
-reach (a jump table in `__text` stops it, a PIC ref goes through the GOT). Run
-`fdis.py` to read a site, `find_callers.py` for the call graph.
+slice; and, on i386, PIC references that go through the GOT rather than an
+absolute address. Run `fdis.py` to read a site, `find_callers.py` for the call
+graph.
 """
 import struct
 import sys
@@ -170,53 +170,63 @@ def code_refs(buf, text_va):
             np.concatenate(kinds).astype(np.int64))
 
 
-def code_refs_x86(data, is64, text, funcs, wanted):
-    """x86/x86_64: (ref_pc, target) for code refs to `wanted`. Best effort.
+def _x86_site(code, text_va, text_size, funcs, pc, md):
+    """The instruction whose displacement/immediate field starts at `pc`."""
+    import bisect
+    if funcs:                                                # forward from the function
+        a = bisect.bisect_right(funcs, pc) - 1
+        start = funcs[a] if a >= 0 else text_va
+        chunk = bytes(code[start - text_va: min(text_size, pc - text_va + 16)])
+        for ins in md.disasm(chunk, start):
+            if ins.address <= pc < ins.address + ins.size:
+                return ins.address
+        return None
+    for s in range(pc, max(0, pc - text_va - 15) + text_va - 1, -1):   # stripped: scan back
+        ins = next(md.disasm(bytes(code[s - text_va:s - text_va + 32]), s), None)
+        if ins and ins.address <= pc < ins.address + ins.size:
+            return ins.address
+    return pc
 
-    Disassembles from each function symbol start when symbols exist (a single
-    linear sweep stops at the first jump table in __text); otherwise a linear
-    sweep. Detects RIP-relative operands (x86_64) and absolute operands /
-    immediates from the mnemonic text, ~5x faster than decoding operands. i386
-    PIC references (through the GOT) are not found; a jump table stops the sweep.
+
+def code_refs_x86(data, is64, text, funcs, wanted):
+    """x86/x86_64: (ref_pc, target) for code refs to `wanted`, near-exact.
+
+    A RIP-relative (x86_64) or absolute (i386) reference stores the target as a
+    32-bit field, so scan every 4-byte window: `int32(code[i:i+4])` plus the
+    instruction end must equal the target. Per-window coincidence is ~2^-32, so
+    the candidates are real; each is then mapped to its instruction with a short
+    disassembly. `k` is the trailing immediate (0/1/4 bytes). i386 PIC refs go
+    through the GOT and are not found.
     """
     z = np.empty(0, np.int64)
-    if not wanted:
+    if not wanted or text[1] < 4:
         return z, z
-    import re
-    import capstone
-    md = capstone.Cs(capstone.CS_ARCH_X86,
-                     capstone.CS_MODE_64 if is64 else capstone.CS_MODE_32)
-    rip_re = re.compile(r"\[rip ([+-]) 0x([0-9a-f]+)\]")
-    hex_re = re.compile(r"(?<![0-9a-f])0x(" + "|".join(f"{v:x}" for v in sorted(wanted))
-                        + r")(?![0-9a-f])")
     text_va, text_size, text_abs = text
-    hi = text_va + text_size
-    regions = ([(s, funcs[i + 1] if i + 1 < len(funcs) else hi) for i, s in enumerate(funcs)]
-               if funcs else [(text_va, hi)])
-    pcs, tgts = [], []
-    for start, end in regions:
-        if not text_va <= start < end <= hi:
-            continue
-        chunk = data[text_abs + (start - text_va): text_abs + (end - text_va)]
-        n = 0
-        for ins in md.disasm(chunk, start):
-            n += ins.size
-            ops = ins.op_str
-            if is64:                                          # RIP-relative operand
-                m = rip_re.search(ops)
-                if m:
-                    d = int(m.group(2), 16)
-                    t = ins.address + ins.size + (d if m.group(1) == "+" else -d)
-                    if t in wanted:
-                        pcs.append(ins.address)
-                        tgts.append(t)
-                    continue
-            m = hex_re.search(ops)                            # absolute / immediate
-            if m:
-                pcs.append(ins.address)
-                tgts.append(int(m.group(1), 16))
-            if n >= end - start:
-                break
+    code = np.frombuffer(data, np.uint8, count=text_size, offset=text_abs)
+    v = (code[:-3].astype(np.int64) | (code[1:-2].astype(np.int64) << 8)
+         | (code[2:-1].astype(np.int64) << 16) | (code[3:].astype(np.int64) << 24))
+    v = (v ^ 0x80000000) - 0x80000000                       # int32 windows
+    idx = np.arange(v.size, dtype=np.int64)
+    md = None
+    pcs, tgts, seen = [], [], set()
+    for t in sorted(wanted):
+        hits = {}
+        if is64:
+            for k in (0, 1, 4):
+                for i in np.flatnonzero(v + idx == t - text_va - 4 - k).tolist():
+                    hits.setdefault(int(i), k)
+        else:
+            hits = {int(i): 0 for i in np.flatnonzero(v == t).tolist()}
+        for i in hits:
+            if md is None:
+                import capstone
+                md = capstone.Cs(capstone.CS_ARCH_X86,
+                                 capstone.CS_MODE_64 if is64 else capstone.CS_MODE_32)
+            site = _x86_site(code, text_va, text_size, funcs, text_va + i, md)
+            if site is not None and (site, t) not in seen:
+                seen.add((site, t))
+                pcs.append(site)
+                tgts.append(t)
     return np.array(pcs, np.int64), np.array(tgts, np.int64)
 
 

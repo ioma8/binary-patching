@@ -98,10 +98,11 @@ audit trail that stops you re-testing the same guess.
 - **find_refs.py** (in this folder) — "who references X": code refs plus pointer
   refs in data (vtables, dispatch tables, `RESSTR` indirection).
   `./find_refs.py <file> <0xADDR|name>... [--str <text>] [--arch ...]`. arm64 code
-  refs (`adrp+add`, `adrp+ldr/str`, `adr`) are exact; on x86/x86_64 they are
-  best-effort (a disassembler sweep — an `__text` jump table stops it, and i386
-  PIC refs through the GOT are not found). The pointer scan is pointer-width
-  aware and works on every arch — it catches the indirection a call scan cannot.
+  refs (`adrp+add`, `adrp+ldr/str`, `adr`) are exact; x86/x86_64 match the 32-bit
+  displacement/immediate field vectorized (near-exact — one disassembly per hit,
+  not per instruction; only i386 PIC refs through the GOT are missed). The
+  pointer scan is pointer-width aware and works on every arch — it catches the
+  indirection a call scan cannot.
 - **patch.py** (in this folder) — declarative applier. Manifest lines
   `<arch> <site> <old_hex> <new_hex>` with `<arch>` = `arm64`/`x86_64`/`x86`/`*`,
   where `<site>` is a VA or a **symbol name** (`_..._GETSTATUS$$TSTATUS`, optional

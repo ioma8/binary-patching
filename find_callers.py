@@ -147,13 +147,20 @@ def main() -> None:
     name_cache: dict[int, str] = {}
     sym_strbase, kstrx, kva = 0, np.empty(0, np.int64), np.empty(0, np.int64)
     sym_va, sym_strx = np.empty(0, np.int64), np.empty(0, np.int64)
-    uniq_strx = np.empty(0, np.int64)
+    all_strx = None
+    _uniq: list = []
 
     def name_at(strx: int) -> str:
         if strx not in name_cache:
             o = sym_strbase + strx
             name_cache[strx] = data[o:data.index(b"\0", o)].decode("utf-8", "replace")
         return name_cache[strx]
+
+    def name_starts():
+        if not _uniq:                                    # built only for a name query
+            _uniq.append(np.unique(all_strx) if all_strx is not None and all_strx.size
+                         else np.empty(0, np.uint32))
+        return _uniq[0]
 
     if symbols_on and symtab is not None:
         symoff, nsyms, stroff, _strsize = symtab
@@ -163,12 +170,12 @@ def main() -> None:
         sel = np.flatnonzero(keep)
         kstrx = arr["n_strx"][sel].astype(np.int64)
         kva = arr["n_value"][sel].astype(np.int64)
+        all_strx = arr["n_strx"]
         if kva.size and np.all(np.diff(kva) >= 0):
             sym_va, sym_strx = kva, kstrx                # table already address-ordered
         elif kva.size:
             order = np.argsort(kva, kind="stable")
             sym_va, sym_strx = kva[order], kstrx[order]
-        uniq_strx = np.unique(arr["n_strx"])  # ALL name starts, incl. filtered symbols
 
     def label_for(va: int) -> str:
         if sym_va.size == 0:
@@ -205,8 +212,9 @@ def main() -> None:
         before = len(targets)
         if hits:
             # the greatest name-start <= a match is the name containing it
-            j = np.searchsorted(uniq_strx, np.array(hits), "right") - 1
-            for strx in np.unique(uniq_strx[j[j >= 0]]):
+            uniq = name_starts()
+            j = np.searchsorted(uniq, np.array(hits), "right") - 1
+            for strx in np.unique(uniq[j[j >= 0]]):
                 for si in np.flatnonzero(kstrx == strx):
                     add(int(kva[si]), name_at(int(strx)))
         if len(targets) == before:
