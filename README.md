@@ -1,8 +1,9 @@
 # binary-patching
 
-Reverse-engineer and patch a compiled binary without source: trace the failing
-path, find the *split point* where two code paths diverge, patch the narrowest
-site, re-sign, and verify.
+Reverse-engineer and patch a compiled binary without source: reproduce the
+symptom, trace the failing path under a debugger, find the *split point* where
+two code paths diverge, patch the narrowest site, re-sign, and verify three
+times.
 
 ## Install
 
@@ -14,31 +15,21 @@ npx skills add ioma8/binary-patching
 
 ## What it does
 
-A six-step loop for modifying compiled binaries deterministically:
+The method — a six-step loop (ground truth → classify → trace backward → find
+the split point → minimal patch → verify 3×), the hypothesis loop, the blind
+routes, and the arm64 encoding crib — lives in [`SKILL.md`](SKILL.md).
 
-1. **Ground truth first** — read logs, crash dumps, files, network before any disassembly.
-2. **Classify** — crash vs assertion vs deliberate exit vs runs-but-wrong.
-3. **Trace backward** — debugger with ASLR off, break on the terminal call, full backtrace.
-4. **Find the decision** — the *split point* (two paths diverge) or *choke point* (one call/compare).
-5. **Patch minimal** — no-op the smallest function, assert pristine bytes, re-sign.
-6. **Verify three times** — bug gone *and* desired behaviour intact.
+Ships six fast helpers for **arm64, x86_64 and i386** Mach-O binaries:
+[`fdis.py`](fdis.py) — disassembler; [`find_callers.py`](find_callers.py) /
+[`find_refs.py`](find_refs.py) / [`find_strings.py`](find_strings.py) — callers,
+references and strings with their addresses; [`patch.py`](patch.py) —
+declarative, all-or-nothing applier; [`resign.py`](resign.py) — ad-hoc
+re-signer. Usage: [`UTILS.md`](UTILS.md).
 
-Includes the tooling (`lldb`, `r2`, `nm`/`otool`, `lipo`, `codesign`, `osascript`),
-the hypothesis loop, and the arm64 encoding crib — all inline in
-[`SKILL.md`](SKILL.md).
-
-Ships six helpers for **arm64, x86_64 and i386** Mach-O binaries:
-[`fdis.py`](fdis.py) — fast single-site disassembler;
-[`find_callers.py`](find_callers.py), [`find_refs.py`](find_refs.py) and
-[`find_strings.py`](find_strings.py) — caller / reference / string finders;
-[`patch.py`](patch.py) — declarative patch applier (address- or
-symbol-addressed); and [`resign.py`](resign.py) — ad-hoc re-signer.
-Usage for every helper: [`UTILS.md`](UTILS.md).
-
-Run [`test_utils.py`](test_utils.py) to check them: it builds a C fixture with
-clang (arm64, x86_64, i386, fat) and validates every tool against `otool` /
-`nm` / `codesign` ground truth. [`bench.sh`](bench.sh) benchmarks each helper
-per architecture with [hyperfine](https://github.com/sharkdp/hyperfine).
+```bash
+./test_utils.py    # 32 tests vs otool / nm / codesign ground truth
+./bench.sh         # hyperfine timings per architecture
+```
 
 ## License
 
