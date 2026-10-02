@@ -64,6 +64,8 @@ audit trail that stops you re-testing the same guess.
 
 ## Tooling
 
+Per-tool usage and examples: `UTILS.md` (this folder).
+
 - **lldb** — `settings set target.disable-aslr true`; `bt`; break on the
   terminal API. The single most decisive move. In stripped dylibs a symbol
   like `___lldb_unnamed_symbol_1f4f8` — the hex suffix is the file offset.
