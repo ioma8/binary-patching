@@ -15,11 +15,12 @@ MH = (0xFEEDFACE, 0xFEEDFACF)
 LC_SEGMENT = 0x01
 LC_SEGMENT_64 = 0x19
 LC_SYMTAB = 0x02
+LC_DYLD_CHAINED_FIXUPS = 0x80000034
 
 
 class Image:
     def __init__(self, fmt, arch, is64, data, base, image_base, segs, sections,
-                 code, header_end, symtab=None, pe_syms=None):
+                 code, header_end, symtab=None, pe_syms=None, chained=False):
         self.fmt = fmt                      # "macho" | "pe"
         self.arch = arch                    # "arm64" | "x86_64" | "x86"
         self.is64 = is64
@@ -32,6 +33,7 @@ class Image:
         self.header_end = header_end
         self.symtab = symtab                # Mach-O (symoff, nsyms, stroff, strsize)
         self.pe_syms = pe_syms or []        # PE [(name, va)]
+        self.chained = chained              # LC_DYLD_CHAINED_FIXUPS present
 
     @property
     def text(self):
@@ -86,6 +88,7 @@ def _load_macho(data, base, arch):
     ncmds = struct.unpack_from("<I", data, base + 16)[0]
     hdr = base + (32 if is64 else 28)
     off, segs, sections, code, symtab = hdr, [], [], [], None
+    chained = False
     for _ in range(ncmds):
         cmd, cmdsize = struct.unpack_from("<II", data, off)
         if cmd in (LC_SEGMENT, LC_SEGMENT_64):
@@ -113,9 +116,11 @@ def _load_macho(data, base, arch):
                 so += secsz
         elif cmd == LC_SYMTAB:
             symtab = tuple(struct.unpack_from("<IIII", data, off + 8))
+        elif cmd == LC_DYLD_CHAINED_FIXUPS:
+            chained = True
         off += cmdsize
     return Image("macho", arch, is64, data, base, 0, segs, sections, code,
-                 off, symtab=symtab)
+                 off, symtab=symtab, chained=chained)
 
 
 def _load_pe(data, arch):

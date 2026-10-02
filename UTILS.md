@@ -75,9 +75,34 @@ Reports two kinds of reference to each target:
 ./find_refs.py BCompare --no-ptr 0x101e38228   # skip the pointer scan
 ```
 
-arm64 code refs are exact; x86/x86_64 match the 32-bit displacement/immediate
-field vectorized (near-exact). On i386, PIC references through the GOT are not
-found.
+arm64 code refs are exact across every executable section (`__text`, `__stubs`,
+`__objc_stubs`, …), not just `__text`; x86/x86_64 match the 32-bit
+displacement/immediate field vectorized (near-exact). On i386, PIC references
+through the GOT are not found.
+
+## find_selrefs.py — Objective-C selector consumers
+
+```bash
+./find_selrefs.py <file> <selector>... [--arch ...] [--no-symbols]
+```
+
+Resolves an Objective-C selector to its `__objc_selrefs` slot(s), then reports
+every code site that loads one, across all executable sections. This is the
+two-hop chain `find_refs.py` cannot do in one query: `__objc_methname` string →
+`__objc_selrefs` pointer → code load. Selector loads are routinely emitted in
+`__objc_stubs` (not `__text`), so a `__text`-only scan reports "(none)" for a
+method that is very much called.
+
+```bash
+./find_selrefs.py BCompare isDemo
+./find_selrefs.py BCompare --arch x86_64 objectForKey:
+```
+
+When a load lands in `__objc_stubs`, its enclosing symbol is the
+`_objc_msgSend$<selector>` thunk — hand that to `find_callers.py` for the real
+callers, because nothing calls the method directly. Selectors with no
+`__objc_selrefs` slot (resolved at runtime) and encoded chained-fixup slots are
+reported explicitly, never silently skipped.
 
 ## find_strings.py — strings with their addresses
 
@@ -112,8 +137,9 @@ Applies a text manifest, one site per line:
 
 - `<arch>` — `arm64` | `x86_64` | `x86` | `*` (`*` = every slice).
 - `<site>` — a VA (`0x1000d7740`) or an **exact symbol name** (unlike the
-  find_* targets, this must match the whole name), optional `+0xoff`. Symbol
-  sites survive updates that move addresses.
+  find_* targets, this must match the whole name), optional `+0xoff`. The name
+  may contain spaces (ObjC `-[Class sel:]`); the suffix is an offset only when
+  it is hex. Symbol sites survive updates that move addresses.
 - `<old_hex>` — the pristine bytes, asserted before writing (`-` to skip).
 - `<new_hex>` — the replacement, the **same length** as `old_hex`.
 
@@ -125,6 +151,7 @@ already present; `--resign <app>` re-signs afterwards.
 arm64  0x1000d7740 fd7bbfa9fd030091 60008052c0035fd6           # by address
 x86_64 0x1000d17a0 554889e5488d b803000000c3                  # by address
 arm64  _CERTDECODE$_$TCERTDECODER_$__$$_GETSTATUS$$TSTATUS - c0035fd6   # by symbol
+arm64  -[CXApplication isDemo]+0x8 00686838 00008052          # ObjC symbol
 ```
 
 ```bash
@@ -156,6 +183,6 @@ Mach-O only (`codesign`); it refuses a PE image — Authenticode signing needs
 ## Checks and benchmarks
 
 ```bash
-./test_utils.py    # 32 tests: builds a clang fixture, checks vs otool/nm/codesign
+./test_utils.py    # 45 tests: builds clang fixtures, checks vs otool/nm/codesign
 ./bench.sh         # hyperfine timings per arch (set BP_ARM/BP_X86/BP_I386 for big binaries)
 ```

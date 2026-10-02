@@ -9,10 +9,11 @@
 Find references to an address, symbol, or string in a Mach-O **or PE** binary
 (arm64, x86_64, i386).
 
-  code — instructions that access the address. arm64: `adrp+add`, `adrp+ldr/str`,
-         `adr` (exact). x86_64: RIP-relative; i386: absolute. Found by matching
-         the 32-bit displacement/immediate field vectorized (near-exact:
-         ~1 in 4e9 windows is coincidence).
+  code — instructions that access the address, across **every** executable
+         section (`__text`, `__stubs`, `__objc_stubs`, …), not just `__text`.
+         arm64: `adrp+add`, `adrp+ldr/str`, `adr` (exact). x86_64: RIP-relative;
+         i386: absolute. Found by matching the 32-bit displacement/immediate
+         field vectorized (near-exact: ~1 in 4e9 windows is coincidence).
   ptr  — pointer-sized values equal to the address: vtables, dispatch tables,
          import tables, `RESSTR` indirection (what a code scan cannot see).
 
@@ -287,19 +288,30 @@ def main() -> None:
             raise SystemExit(f"string {s!r}: {where}")
 
     # ---- scans ---------------------------------------------------------------
+    # Every executable section, not just __text: selector loads and other
+    # adrp+ldr pairs are emitted in __stubs / __stub_helper / __objc_stubs too.
     ref_pc = ref_tgt = ref_kind = np.empty(0, np.int64)
-    funcs: list[int] = []
-    if do_code and img.text is not None:
-        text_va, text_size, text_abs = img.text
-        if img.arch == "arm64":
-            buf = np.frombuffer(img.data, dtype=np.uint8, count=text_size, offset=text_abs)
-            ref_pc, ref_tgt, ref_kind = code_refs(buf, text_va)
-        else:
-            n = int(np.searchsorted(sym_va, text_va + text_size))
-            lo = int(np.searchsorted(sym_va, text_va))
-            funcs = sorted({int(v) for v in sym_va[lo:n]})
-            ref_pc, ref_tgt = code_refs_x86(img.data, is64, img.text, funcs, set(seen))
-            ref_kind = np.zeros(ref_pc.size, np.int64)
+    pc_parts: list[np.ndarray] = []
+    tgt_parts: list[np.ndarray] = []
+    kind_parts: list[np.ndarray] = []
+    if do_code:
+        for cva, csize, coff in img.code:
+            if img.arch == "arm64":
+                buf = np.frombuffer(img.data, dtype=np.uint8, count=csize, offset=coff)
+                p, t, k = code_refs(buf, cva)
+            else:
+                n = int(np.searchsorted(sym_va, cva + csize))
+                lo = int(np.searchsorted(sym_va, cva))
+                funcs = sorted({int(v) for v in sym_va[lo:n]})
+                p, t = code_refs_x86(img.data, is64, (cva, csize, coff), funcs, set(seen))
+                k = np.zeros(p.size, np.int64)
+            pc_parts.append(p)
+            tgt_parts.append(t)
+            kind_parts.append(k)
+        if pc_parts:
+            ref_pc = np.concatenate(pc_parts)
+            ref_tgt = np.concatenate(tgt_parts)
+            ref_kind = np.concatenate(kind_parts).astype(np.int64)
 
     ptr_hits: dict[int, list[int]] = {}
     if do_ptr:

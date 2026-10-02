@@ -21,8 +21,8 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = {n: os.path.join(HERE, n) for n in
-        ("fdis.py", "find_callers.py", "find_refs.py", "find_strings.py",
-         "patch.py", "resign.py")}
+        ("fdis.py", "find_callers.py", "find_refs.py", "find_selrefs.py",
+         "find_strings.py", "patch.py", "resign.py")}
 FX = {}
 
 C_SRC = r"""
@@ -40,6 +40,21 @@ int g_counter = 0;
 __attribute__((noinline)) void target_fn(void) { g_counter += 7; }
 __attribute__((noinline)) void other_fn(void) { g_counter += 1; }
 int main(void) { target_fn(); other_fn(); target_fn(); return g_counter; }
+"""
+
+OBJC_SRC = r"""
+__attribute__((objc_root_class))
+@interface Foo
+- (int)alpha;
+- (int)beta;
++ (int)klass;
+@end
+@implementation Foo
+- (int)alpha { return 1; }
+- (int)beta { return 2; }
++ (int)klass { return 3; }
+@end
+int main(void) { Foo *f = 0; return [f alpha] + [f beta] + [Foo klass]; }
 """
 
 
@@ -62,6 +77,15 @@ def nm_sym(path, name, nm="nm"):
         f = line.split()
         if len(f) == 3 and f[2] == name:
             return int(f[0], 16)
+    return None
+
+
+def nm_sym_full(path, name, nm="nm"):
+    """nm lookup for a name containing spaces (ObjC `-[Foo bar]`)."""
+    for line in subprocess.run([nm, path], capture_output=True, text=True).stdout.splitlines():
+        m = re.match(r"^([0-9a-f]+)\s+\S+\s+(.*)$", line)
+        if m and m.group(2) == name:
+            return int(m.group(1), 16)
     return None
 
 
@@ -184,6 +208,20 @@ def setUpModule():
         FX[f"{key}_counter"] = nm_sym(FX[key], "_g_counter")
     FX["i386_target"] = nm_sym(FX["i386"], "_target_fn")
     FX["i386_counter"] = nm_sym(FX["i386"], "_g_counter")
+
+    # Objective-C fixture (optional): __objc_methname -> __objc_selrefs -> code.
+    # Forced to classic rebases so the slots hold plain VAs (see find_selrefs.py).
+    m_src = os.path.join(d, "fx.m")
+    with open(m_src, "w") as f:
+        f.write(OBJC_SRC)
+    for arch, key in (("arm64", "objc"), ("x86_64", "objc_x86")):
+        out = os.path.join(d, key)
+        try:
+            subprocess.run(["clang", "-O0", "-arch", arch, "-Wl,-no_fixup_chains",
+                            "-o", out, m_src, "-lobjc"], check=True, capture_output=True)
+            FX[key] = out
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            FX[key] = None
 
     # PE fixtures (mingw-w64 is optional; PE tests skip without it)
     m64, m32 = shutil.which("x86_64-w64-mingw32-gcc"), shutil.which("i686-w64-mingw32-gcc")
@@ -317,6 +355,71 @@ class TestFindRefs(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
 
 
+class TestFindSelrefs(unittest.TestCase):
+    def setUp(self):
+        if not FX.get("objc"):
+            self.skipTest("ObjC fixture not built")
+
+    def _slot(self, out):
+        m = re.search(r"^\s+selref\s+([0-9a-f]{16})", out, re.M)
+        self.assertIsNotNone(m, out)
+        return int(m.group(1), 16)
+
+    def _loads(self, out):
+        return {int(m.group(1), 16)
+                for m in re.finditer(r"^\s+load\s+([0-9a-f]{16})", out, re.M)}
+
+    def test_chain_finds_selref_and_load(self):
+        r = run("find_selrefs.py", FX["objc"], "alpha")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(re.findall(r"^\s+selref\s+[0-9a-f]{16}", r.stdout, re.M)), 1)
+        self.assertTrue(self._loads(r.stdout), r.stdout)
+
+    def _alpha_stub(self):
+        # otool -tv only disassembles __text, so the __objc_stubs load needs an
+        # `nm` anchor instead of otool ground truth (same blind spot the fix
+        # addresses). The stub is `adrp; ldr` -> the load sits in its first bytes.
+        stub = nm_sym(FX["objc"], "_objc_msgSend$alpha")
+        self.assertIsNotNone(stub)
+        return stub
+
+    def test_arm64_load_is_in_objc_stub(self):
+        r = run("find_selrefs.py", FX["objc"], "alpha")
+        loads = self._loads(r.stdout)
+        self.assertEqual(len(loads), 1, r.stdout)
+        stub = self._alpha_stub()
+        self.assertTrue(stub <= next(iter(loads)) < stub + 0x10, hex(next(iter(loads))))
+
+    def test_find_refs_sees_objc_stubs_load(self):
+        """Regression: find_refs scanned only __text and missed __objc_stubs."""
+        r = run("find_selrefs.py", FX["objc"], "alpha")
+        slot = self._slot(r.stdout)
+        stub = self._alpha_stub()
+        refs = run("find_refs.py", FX["objc"], "--no-ptr", hex(slot))
+        self.assertEqual(refs.returncode, 0, refs.stderr)
+        got = find_refs_sites(refs.stdout, "code")
+        self.assertEqual(len(got), 1, refs.stdout)
+        self.assertTrue(stub <= next(iter(got)) < stub + 0x10)
+
+    def test_x86_64_loads_match_otool(self):
+        if not FX.get("objc_x86"):
+            self.skipTest("x86_64 ObjC fixture not built")
+        r = run("find_selrefs.py", FX["objc_x86"], "--arch", "x86_64", "alpha")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._loads(r.stdout),
+                         otool_x86_refs(FX["objc_x86"], self._slot(r.stdout)))
+
+    def test_absent_selector(self):
+        r = run("find_selrefs.py", FX["objc"], "gamma")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("(none)", r.stdout)
+
+    def test_non_objc_image_errors(self):
+        r = run("find_selrefs.py", FX["arm"], "alpha")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotIn("Traceback", r.stderr)
+
+
 class TestFindStrings(unittest.TestCase):
     def test_literal_with_va_then_refs(self):
         """A discovered string VA feeds straight into find_refs."""
@@ -389,6 +492,26 @@ class TestPatch(unittest.TestCase):
         r = run("patch.py", tgt, m)
         self.assertEqual(r.returncode, 0, r.stdout)
         self.assertIn(hex(FX["arm_target"]), r.stdout)
+
+    def test_objc_symbol_with_space(self):
+        if not FX.get("objc"):
+            self.skipTest("ObjC fixture not built")
+        tgt = self._copy(FX["objc"])
+        va = nm_sym_full(FX["objc"], "-[Foo alpha]")
+        self.assertIsNotNone(va)
+        r = run("patch.py", tgt, self._manifest("arm64 -[Foo alpha] - c0035fd6\n"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(hex(va), r.stdout)
+
+    def test_objc_class_symbol_leading_plus(self):
+        if not FX.get("objc"):
+            self.skipTest("ObjC fixture not built")
+        tgt = self._copy(FX["objc"])
+        va = nm_sym_full(FX["objc"], "+[Foo klass]")
+        self.assertIsNotNone(va)
+        r = run("patch.py", tgt, self._manifest("arm64 +[Foo klass] - c0035fd6\n"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(hex(va), r.stdout)
 
     def test_x86_symbol_site_at_zero(self):
         """An object's first function sits at address 0; lookup must not skip it."""

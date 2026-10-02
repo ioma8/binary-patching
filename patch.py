@@ -11,7 +11,9 @@ pristine bytes at every site before writing any of them.
 Manifest: one site per line, `<arch> <site> <old_hex> <new_hex>  # comment`
   arch    arm64 | x86_64 | x86 | *   (* = every architecture present)
   site    a virtual address (`0x1000d7740`) or an exact symbol name, optional
-          `+0xoff`. Symbol sites survive updates that move addresses.
+          `+0xoff`. A symbol may contain spaces (ObjC `-[Class sel:]`); the
+          suffix is an offset only when it is hex. Symbol sites survive updates
+          that move addresses.
   old_hex expected bytes (asserted; `-` to skip)
   new_hex replacement bytes (must be the same length as old_hex)
 
@@ -24,6 +26,7 @@ Example manifest:
   arm64  0x1000d7740 fd7bbfa9fd030091 60008052c0035fd6       # by address
   x86_64 0x1000d17a0 554889e5488d b803000000c3            # by address
   arm64  _CERTDECODE$_$TCERTDECODER_$__$$_GETSTATUS$$TSTATUS - c0035fd6
+  arm64  -[CXApplication isDemo]+0x8 00686838 00008052            # ObjC symbol
 """
 import os
 import struct
@@ -68,13 +71,23 @@ def exact_symbol(img, data, name: str):
 
 
 def parse_loc(loc: str):
-    """'0xADDR[+off]' -> ('va', addr); 'sym[+0xoff]' -> ('sym', name, off)."""
+    """'0xADDR[+off]' -> ('va', addr); 'sym[+0xoff]' -> ('sym', name, off).
+
+    The suffix after the last '+' is an offset only when it is hex, so an ObjC
+    name that starts with '+' or contains '+' (`+[Foo bar]`) is not split.
+    """
     base, plus, offs = loc.rpartition("+")
+    off = 0
     if not plus:
-        base, offs = loc, "0"
+        base = loc
+    else:
+        try:
+            off = int(offs, 16)
+        except ValueError:
+            base = loc
     if base.lower().startswith("0x"):
-        return ("va", int(base, 16) + int(offs, 16))
-    return ("sym", base, int(offs, 16))
+        return ("va", int(base, 16) + off)
+    return ("sym", base, off)
 
 
 def parse_manifest(text: str):
@@ -84,9 +97,9 @@ def parse_manifest(text: str):
         if not line:
             continue
         p = line.split()
-        if len(p) != 4:
+        if len(p) < 4:
             raise SystemExit(f"manifest line {ln}: expected <arch> <site> <old_hex> <new_hex>")
-        arch, loc, old_s, new_s = p[0].lower(), p[1], p[2], p[3]
+        arch, loc, old_s, new_s = p[0].lower(), " ".join(p[1:-2]), p[-2], p[-1]
         if arch not in ("arm64", "x86_64", "x86", "*"):
             raise SystemExit(f"manifest line {ln}: arch must be arm64|x86_64|x86|*")
         old = None if old_s == "-" else bytes.fromhex(old_s.removeprefix("0x"))

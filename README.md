@@ -19,15 +19,16 @@ The method — a six-step loop (ground truth → classify → trace backward →
 the split point → minimal patch → verify 3×), the hypothesis loop, the blind
 routes, and the arm64 encoding crib — lives in [`SKILL.md`](SKILL.md).
 
-Ships six fast helpers for **arm64 / x86_64 / i386**, in **Mach-O and PE**:
+Ships seven fast helpers for **arm64 / x86_64 / i386**, in **Mach-O and PE**:
 [`fdis.py`](fdis.py) — disassembler; [`find_callers.py`](find_callers.py) /
-[`find_refs.py`](find_refs.py) / [`find_strings.py`](find_strings.py) — callers,
-references and strings with their addresses; [`patch.py`](patch.py) —
+[`find_refs.py`](find_refs.py) / [`find_selrefs.py`](find_selrefs.py) /
+[`find_strings.py`](find_strings.py) — callers, references, ObjC selector
+consumers and strings with their addresses; [`patch.py`](patch.py) —
 declarative, all-or-nothing applier; [`resign.py`](resign.py) — ad-hoc
 re-signer (Mach-O only). Usage: [`UTILS.md`](UTILS.md).
 
 ```bash
-./test_utils.py    # 32 tests vs otool / nm / codesign ground truth
+./test_utils.py    # 45 tests vs otool / nm / codesign ground truth
 ./bench.sh         # hyperfine timings per architecture
 ```
 

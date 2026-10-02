@@ -16,9 +16,12 @@ Modify a compiled binary's behaviour without source.
 
 2. **Classify.** Name the failure: **crash** (exception type + faulting address),
    **assertion** (message), **deliberate exit** (return code / clean shutdown),
-   or **runs-but-wrong** (visible symptom). *Done when:* the category is named.
-   Each category starts a different search — "quits after N seconds" is a quit,
-   not a crash.
+   **runs-but-wrong** (visible symptom), or **signature kill**
+   (`Code Signature Invalid` / `CODESIGNING`, `SIGKILL`). *Done when:* the
+   category is named. Each category starts a different search — "quits after N
+   seconds" is a quit, not a crash. A signature kill is the residue of a write
+   to a signed image: its backtrace points wherever execution happened to be,
+   not at the fault — re-sign and re-run instead of reading the stack.
 
 3. **Trace backward.** Run under a debugger with **ASLR disabled** (runtime
    address == file offset); break on the *terminal* call (`-[NSApplication
@@ -44,7 +47,14 @@ Modify a compiled binary's behaviour without source.
    hand-encoding is a bug farm); re-sign (frameworks first, then `--deep` the
    app); confirm the exact bytes landed. Patch code the target ships itself —
    bundled frameworks/dylibs are local and patchable, system frameworks are
-   shared. *Done when:* bytes verified and `codesign --verify --deep` passes.
+   shared. Behaviour that lives in a compiled resource — a `nib`/storyboard, a
+   plist, a PE resource — is a serialized edit, not an instruction; find the
+   object that carries the state. Before mutating a structured blob, prove the
+   writer by re-serializing the untouched original **byte-identical** — a writer
+   that cannot reproduce the original cannot be trusted to edit it, and if the
+   format parser ships no writer (Apple `nibarchive`), you write one and prove
+   it the same way. *Done when:* bytes verified and `codesign --verify --deep`
+   passes.
 
 6. **Verify three times.** The bug is gone **and** the desired behaviour still
    works, three clean runs. Observe on the cheapest **reliable** signal first —
@@ -86,10 +96,18 @@ examples: `UTILS.md`.
 - **find_refs.py** — who references X: code refs plus pointer refs in data
   (vtables, dispatch tables, `RESSTR` indirection).
   `./find_refs.py <file> <0xADDR|name>... [--str <text>] [--arch ...]`. arm64 code
-  refs (`adrp+add`, `adrp+ldr/str`, `adr`) are exact; x86/x86_64 match the 32-bit
-  displacement/immediate field vectorized (near-exact; only i386 PIC refs through
-  the GOT are missed). The pointer scan is pointer-width aware on every arch and
-  catches the indirection a call scan cannot.
+  refs (`adrp+add`, `adrp+ldr/str`, `adr`) are exact across **every** executable
+  section (`__text`, `__stubs`, `__objc_stubs`, …), not just `__text`; x86/x86_64
+  match the 32-bit displacement/immediate field vectorized (near-exact; only i386
+  PIC refs through the GOT are missed). The pointer scan is pointer-width aware on
+  every arch and catches the indirection a call scan cannot.
+- **find_selrefs.py** — Objective-C selector consumers:
+  `./find_selrefs.py <file> <selector>... [--arch ...]`. Resolves a selector
+  through `__objc_methname` → `__objc_selrefs` → the code that loads the slot,
+  across every executable section. The load usually sits in `__objc_stubs`; hand
+  its enclosing `_objc_msgSend$<sel>` symbol to `find_callers.py` for the real
+  callers. Reach for this instead of `find_callers.py` on an ObjC method, which
+  returns 0 because callers go through that thunk.
 - **find_strings.py** — strings with their **addresses** (not file offsets):
   `./find_strings.py <file> [pattern] [--section S] [--min N] [--regex]`.
   Section contents only, no symbol-table noise; skips `__text` unless `--all`;
@@ -120,7 +138,8 @@ External tools, as fallbacks (examples are `otool`-flavoured; use `objdump` for 
   without runtime**: library validation rejects the freshly re-signed bundled
   dylibs if runtime is kept (`resign.py` above does this).
 - **osascript** — drive a user action (`tell app "X" to quit`) to capture the
-  *correct* backtrace for the split-point diff.
+  *correct* backtrace for the split-point diff, or list and diff window titles
+  before/after a menu click to identify the handler with no debugger at all.
 
 ## r2 cheat sheet
 
@@ -151,7 +170,8 @@ real patch in Python with `patch.py` (asserts + per-slice), not `wx`.
 - Assuming a field getter *is* the decision → trace to the branch that consumes
   it. Forcing a getter's return crashes consumers that then read fields the
   alternate state never fills — patch the decision, or the getter **and** every
-  newly-reached consumer.
+  newly-reached consumer. Once a consumer scan proves the getter has a single
+  reader, the getter *is* the choke point and is the simpler site.
 - Blanket early-return on a function family → mixed return conventions crash;
   no-op the one smallest function.
 - No-op'ing a dialog's `exec()` only → it is still constructed and trips a
@@ -179,7 +199,21 @@ real patch in Python with `patch.py` (asserts + per-slice), not `wx`.
 - Trusting a single green run → "works once" then fails; verify 3×.
 - Trusting a stale crash report → timestamp it against the last patch.
 - Patching system frameworks (AppKit/dyld) → patch the target's bundled code.
-- Broad greps / whole-file reads → xrefs + small `pd` windows.
+- Broad greps / whole-file reads → xrefs + small `pd` windows; over a large app
+  bundle, go straight to `Resources/` and the localization files.
+- Empty code xref → "nothing drives it" → the behaviour may be
+  **resource-driven**: its entry point lives in a nib/storyboard/plist, not code.
+  Check the resources before declaring the path dead.
+- Trusting a nib/plist key because it exists → compiled resources carry
+  design-time metadata the runtime ignores; test one item and observe before
+  building a theory on a key. To remove a UI element, drop its reference from
+  the owning collection — do not hunt a hide property that is not honoured.
+- Closing the state flag and calling the flow dead → a false flag does not stop
+  an explicit action (menu item, button, timer) from re-entering. Enumerate the
+  **entry points** as gates and patch each; a residual symptom after a correct
+  state patch is a second gate, not a failed first patch.
+- Reading a parser's dict view of a repeated-key structure → array-like data
+  (repeated keys, one element each) collapses silently; read the raw value list.
 
 ## arm64 encoding crib
 
@@ -202,3 +236,8 @@ untouched.
 | `tbz wN,#b,<t>` (4B) | `0x36000000 \| (((t−PC)>>2) << 5) \| (b << 19) \| N` |
 | `ldrb wN,[xM,#o]` (4B) | `0x39400000 \| (o << 10) \| (M << 5) \| N` |
 | `ldrh wN,[xM,#o]` (4B) | `0x79400000 \| ((o/2) << 10) \| (M << 5) \| N` — imm scaled ×2 |
+
+A conditional branch is not a `b` with a different opcode byte: `cbz`/`tbz`/
+`b.cond` keep the offset at bit 5, while `b` reads it at bit 0. Swapping the
+opcode reuses the wrong bits and lands far from the target — re-encode from the
+destination.
