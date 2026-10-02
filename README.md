@@ -27,9 +27,10 @@ Includes the tooling (`lldb`, `r2`, `nm`/`otool`, `lipo`, `codesign`, `osascript
 the hypothesis loop, and the arm64 encoding crib — all inline in
 [`SKILL.md`](SKILL.md).
 
-Ships five helpers: [`fdis.py`](fdis.py) — fast single-site disassembler;
+Ships five helpers for **arm64, x86_64 and i386** Mach-O binaries:
+[`fdis.py`](fdis.py) — fast single-site disassembler;
 [`find_callers.py`](find_callers.py) and [`find_refs.py`](find_refs.py) —
-vectorized caller / reference finders; [`patch.py`](patch.py) — declarative
+caller / reference finders; [`patch.py`](patch.py) — declarative
 patch applier (address- or symbol-addressed); and [`resign.py`](resign.py) —
 ad-hoc re-signer.
 

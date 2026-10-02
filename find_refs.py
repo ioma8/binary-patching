@@ -1,26 +1,30 @@
 #!/usr/bin/env -S uv run --quiet
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["numpy"]
+# dependencies = ["numpy", "capstone"]
 # ///
-"""find_refs.py <file> <target>... [--str <text>] [--arch arm64|x86_64]
+"""find_refs.py <file> <target>... [--str <text>] [--arch arm64|x86_64|x86]
                 [--no-code] [--no-ptr] [--no-symbols]
 
-Find references to an address, symbol, or string in a Mach-O binary.
+Find references to an address, symbol, or string in a Mach-O binary (arm64,
+x86_64, i386).
 
-  code — instructions that materialize or access the address: `adrp+add`,
-         `adrp+ldr/str`, `adr`
-  ptr  — 8-byte pointer values equal to the address: vtables, dispatch tables,
-         RESSTR indirection (things a code scan cannot see)
+  code — instructions that materialize/access the address. arm64: `adrp+add`,
+         `adrp+ldr/str`, `adr` (exact). x86_64: RIP-relative operands. i386:
+         absolute operands. (x86 code refs need a disassembler and are best
+         effort — see the note below.)
+  ptr  — pointer-sized values equal to the address: vtables, dispatch tables,
+         RESSTR indirection (things the code scan cannot see).
 
 Targets are `0xADDR` or a symbol-name substring. `--str <text>` locates a string
-literal first, then reports references to it. Vectorized (NumPy): the scan is
-~15 ms on a 56 MB slice, ~0.1 s wall (dominated by interpreter + NumPy import).
+literal first, then reports references to it.
 
 Columns: `kind  va  detail`.
 
-Misses: references computed at runtime, unaligned pointers, and the other arch
-slice. Run `fdis.py` to read a site, `find_callers.py` for the call graph.
+Misses: references computed at runtime; unaligned pointers; the other arch
+slice; and, for x86, code references that a linear/disassembler sweep cannot
+reach (a jump table in `__text` stops it, a PIC ref goes through the GOT). Run
+`fdis.py` to read a site, `find_callers.py` for the call graph.
 """
 import struct
 import sys
@@ -29,27 +33,30 @@ import numpy as np
 
 FAT_MAGIC = 0xCAFEBABE
 FAT_MAGIC_64 = 0xCAFEBABF
+MH_MAGIC = 0xFEEDFACE
 MH_MAGIC_64 = 0xFEEDFACF
-CPU_ARM64 = 0x0100000C
-CPU_X86_64 = 0x01000007
+LC_SEGMENT = 0x01
 LC_SEGMENT_64 = 0x19
 LC_SYMTAB = 0x02
-NLIST64 = np.dtype([("n_strx", "<u4"), ("n_type", "u1"), ("n_sect", "u1"),
-                    ("n_desc", "<u2"), ("n_value", "<u8")])
+CPU = {"arm64": 0x0100000C, "x86_64": 0x01000007, "x86": 0x00000007}
+CPU_NAME = {v: k for k, v in CPU.items()}
+NLIST = {True: np.dtype([("n_strx", "<u4"), ("n_type", "u1"), ("n_sect", "u1"),
+                         ("n_desc", "<u2"), ("n_value", "<u8")]),
+         False: np.dtype([("n_strx", "<u4"), ("n_type", "u1"), ("n_sect", "u1"),
+                          ("n_desc", "<u2"), ("n_value", "<u4")])}
 SKIP_SEGS = {"__PAGEZERO", "__LINKEDIT"}
 KIND = {0: "adrp+add", 1: "adrp+ldr", 2: "adrp+str", 3: "adrp+ldr32",
         4: "adrp+str32", 5: "adr"}
 
 
 def pick_slice(data: bytes, want_cpu: int):
-    if struct.unpack("<I", data[:4])[0] == MH_MAGIC_64:
+    if struct.unpack("<I", data[:4])[0] in (MH_MAGIC, MH_MAGIC_64):
         return 0, len(data), struct.unpack("<I", data[4:8])[0]
     magic = struct.unpack(">I", data[:4])[0]
     if magic not in (FAT_MAGIC, FAT_MAGIC_64):
         raise SystemExit("not a Mach-O / fat Mach-O")
-    nfat = struct.unpack(">I", data[4:8])[0]
     off = 8
-    for _ in range(nfat):
+    for _ in range(struct.unpack(">I", data[4:8])[0]):
         if magic == FAT_MAGIC_64:
             cputype = struct.unpack(">I", data[off:off + 4])[0]
             offset, size = struct.unpack(">QQ", data[off + 8:off + 24])
@@ -63,24 +70,27 @@ def pick_slice(data: bytes, want_cpu: int):
     raise SystemExit("requested slice not present in fat binary")
 
 
-def load_macho(data: bytes, base: int):
+def load_macho(data: bytes, base: int, is64: bool):
     """(segments, __text, symtab); segment/offset values are absolute."""
     ncmds = struct.unpack_from("<I", data, base + 16)[0]
-    off = base + 32
+    off = base + (32 if is64 else 28)
     segs, text, symtab = [], None, None
     for _ in range(ncmds):
         cmd, cmdsize = struct.unpack_from("<II", data, off)
-        if cmd == LC_SEGMENT_64:
+        if cmd in (LC_SEGMENT, LC_SEGMENT_64):
             name = data[off + 8:off + 24].split(b"\0", 1)[0].decode()
-            vmaddr, vmsize, fileoff, filesize = struct.unpack_from("<QQQQ", data, off + 24)
+            if is64:
+                vmaddr, vmsize, fileoff, filesize = struct.unpack_from("<QQQQ", data, off + 24)
+                nsects, so, secsz = struct.unpack_from("<I", data, off + 64)[0], off + 72, 80
+            else:
+                vmaddr, vmsize, fileoff, filesize = struct.unpack_from("<IIII", data, off + 24)
+                nsects, so, secsz = struct.unpack_from("<I", data, off + 48)[0], off + 56, 68
             segs.append((name, vmaddr, vmsize, base + fileoff, filesize))
-            nsects = struct.unpack_from("<I", data, off + 64)[0]
-            so = off + 72
             for _ in range(nsects):
                 if data[so:so + 16].split(b"\0", 1)[0] == b"__text":
-                    addr, size, offset = struct.unpack_from("<QQI", data, so + 32)
+                    addr, size, offset = struct.unpack_from("<QQI" if is64 else "<III", data, so + 32)
                     text = (addr, size, base + offset)
-                so += 80
+                so += secsz
         elif cmd == LC_SYMTAB:
             symtab = struct.unpack_from("<IIII", data, off + 8)
         off += cmdsize
@@ -97,13 +107,13 @@ def va_to_fo(segs, va):
 
 def fo_to_va(segs, fo):
     for name, vmaddr, vmsize, fileoff, filesize in segs:
-        if fileoff <= fo < fileoff + filesize and name not in ("__PAGEZERO", "__LINKEDIT"):
+        if fileoff <= fo < fileoff + filesize and name not in SKIP_SEGS:
             return vmaddr + (fo - fileoff)
     return None
 
 
 def code_refs(buf, text_va):
-    """(ref_pc, target, kind_code) for every adrp-paired or adr address."""
+    """arm64: (ref_pc, target, kind) for every adrp-paired or adr address."""
     n = len(buf) // 4
     w = buf[: n * 4].view("<u4")
     top = w & 0x9F000000                                     # shared by adrp/adr
@@ -160,6 +170,56 @@ def code_refs(buf, text_va):
             np.concatenate(kinds).astype(np.int64))
 
 
+def code_refs_x86(data, is64, text, funcs, wanted):
+    """x86/x86_64: (ref_pc, target) for code refs to `wanted`. Best effort.
+
+    Disassembles from each function symbol start when symbols exist (a single
+    linear sweep stops at the first jump table in __text); otherwise a linear
+    sweep. Detects RIP-relative operands (x86_64) and absolute operands /
+    immediates from the mnemonic text, ~5x faster than decoding operands. i386
+    PIC references (through the GOT) are not found; a jump table stops the sweep.
+    """
+    z = np.empty(0, np.int64)
+    if not wanted:
+        return z, z
+    import re
+    import capstone
+    md = capstone.Cs(capstone.CS_ARCH_X86,
+                     capstone.CS_MODE_64 if is64 else capstone.CS_MODE_32)
+    rip_re = re.compile(r"\[rip ([+-]) 0x([0-9a-f]+)\]")
+    hex_re = re.compile(r"(?<![0-9a-f])0x(" + "|".join(f"{v:x}" for v in sorted(wanted))
+                        + r")(?![0-9a-f])")
+    text_va, text_size, text_abs = text
+    hi = text_va + text_size
+    regions = ([(s, funcs[i + 1] if i + 1 < len(funcs) else hi) for i, s in enumerate(funcs)]
+               if funcs else [(text_va, hi)])
+    pcs, tgts = [], []
+    for start, end in regions:
+        if not text_va <= start < end <= hi:
+            continue
+        chunk = data[text_abs + (start - text_va): text_abs + (end - text_va)]
+        n = 0
+        for ins in md.disasm(chunk, start):
+            n += ins.size
+            ops = ins.op_str
+            if is64:                                          # RIP-relative operand
+                m = rip_re.search(ops)
+                if m:
+                    d = int(m.group(2), 16)
+                    t = ins.address + ins.size + (d if m.group(1) == "+" else -d)
+                    if t in wanted:
+                        pcs.append(ins.address)
+                        tgts.append(t)
+                    continue
+            m = hex_re.search(ops)                            # absolute / immediate
+            if m:
+                pcs.append(ins.address)
+                tgts.append(int(m.group(1), 16))
+            if n >= end - start:
+                break
+    return np.array(pcs, np.int64), np.array(tgts, np.int64)
+
+
 def main() -> None:
     arch, do_code, do_ptr, symbols_on, explicit = "arm64", True, True, True, False
     strs, pos, args, i = [], [], sys.argv[1:], 0
@@ -186,18 +246,21 @@ def main() -> None:
         raise SystemExit(1)
     path, target_args = pos[0], pos[1:]
 
-    want_cpu = {"arm64": CPU_ARM64, "x86_64": CPU_X86_64}.get(arch)
+    want_cpu = CPU.get(arch)
     if want_cpu is None:
-        raise SystemExit(f"unknown --arch {arch!r}; use arm64|x86_64")
+        raise SystemExit(f"unknown --arch {arch!r}; use arm64|x86_64|x86")
     data = open(path, "rb").read()
     base, _size, cputype = pick_slice(data, want_cpu)
     if explicit and cputype != want_cpu:
         raise SystemExit(f"--arch {arch}: no {arch} slice in this thin binary")
-    arch = "arm64" if cputype == CPU_ARM64 else "x86_64"
-    if arch != "arm64" and do_code:
-        raise SystemExit("code-ref scan is arm64-only; pass --no-code for x86_64")
+    arch = CPU_NAME.get(cputype)
+    if arch is None:
+        raise SystemExit(f"unsupported cputype {cputype:#x}")
+    is64 = struct.unpack("<I", data[base:base + 4])[0] == MH_MAGIC_64
+    if arch not in ("arm64", "x86_64", "x86"):
+        raise SystemExit(f"unsupported arch {arch}")
 
-    segs, text, symtab = load_macho(data, base)
+    segs, text, symtab = load_macho(data, base, is64)
     if text is None:
         raise SystemExit("no __text section")
 
@@ -207,6 +270,7 @@ def main() -> None:
     sym_va = sym_strx = np.empty(0, np.int64)
     all_strx = None
     _uniq: list = []
+    funcs: list[int] = []
 
     def name_at(strx: int) -> str:
         if strx not in name_cache:
@@ -223,9 +287,8 @@ def main() -> None:
     if symbols_on and symtab is not None:
         symoff, nsyms, stroff, _ss = symtab
         sym_strbase = base + stroff
-        arr = np.frombuffer(data, dtype=NLIST64, count=nsyms, offset=base + symoff)
-        keep = ((arr["n_type"] & 0x0E) == 0x0E) & ((arr["n_type"] & 0xE0) == 0) \
-            & (arr["n_value"] > 0)
+        arr = np.frombuffer(data, dtype=NLIST[is64], count=nsyms, offset=base + symoff)
+        keep = ((arr["n_type"] & 0x0E) == 0x0E) & ((arr["n_type"] & 0xE0) == 0)  # N_SECT
         sel = np.flatnonzero(keep)
         kstrx = arr["n_strx"][sel].astype(np.int64)
         kva = arr["n_value"][sel].astype(np.int64)
@@ -235,6 +298,8 @@ def main() -> None:
         elif kva.size:
             order = np.argsort(kva, kind="stable")
             sym_va, sym_strx = kva[order], kstrx[order]
+        tva, tsz, _to = text
+        funcs = sorted({int(v) for v in kva if tva <= v < tva + tsz})
 
     def label_for(va: int) -> str:
         if sym_va.size == 0:
@@ -301,24 +366,29 @@ def main() -> None:
     ref_pc = ref_tgt = ref_kind = np.empty(0, np.int64)
     if do_code and text is not None:
         text_va, text_size, text_abs = text
-        buf = np.frombuffer(data, dtype=np.uint8, count=text_size, offset=text_abs)
-        ref_pc, ref_tgt, ref_kind = code_refs(buf, text_va)
+        if arch == "arm64":
+            buf = np.frombuffer(data, dtype=np.uint8, count=text_size, offset=text_abs)
+            ref_pc, ref_tgt, ref_kind = code_refs(buf, text_va)
+        else:
+            ref_pc, ref_tgt = code_refs_x86(data, is64, text, funcs, set(tgt and seen))
+            ref_kind = np.zeros(ref_pc.size, np.int64)
 
     ptr_hits: dict[int, list[int]] = {}
     if do_ptr:
+        psz = 8 if is64 else 4
         tarr = np.array(sorted(seen), dtype=np.uint64)
         # start of section data: the Mach-O header + load commands hold no pointers
-        hdr_end = base + 32 + struct.unpack_from("<I", data, base + 20)[0]
+        hdr_end = base + (32 if is64 else 28) + struct.unpack_from("<I", data, base + 20)[0]
         for name, vmaddr, _vmsize, fileoff, filesize in segs:
             lo = max(fileoff, hdr_end)
             avail = fileoff + filesize - lo
-            if name in SKIP_SEGS or avail < 8:
+            if name in SKIP_SEGS or avail < psz:
                 continue
-            words = np.frombuffer(data, "<u8", count=avail // 8, offset=lo)
+            words = np.frombuffer(data, "<u8" if is64 else "<u4", count=avail // psz, offset=lo)
             base_va = vmaddr + (lo - fileoff)
             sel = np.isin(words, tarr)
             for idx in np.flatnonzero(sel):
-                ptr_hits.setdefault(int(words[idx]), []).append(int(base_va + idx * 8))
+                ptr_hits.setdefault(int(words[idx]), []).append(int(base_va + idx * psz))
 
     # ---- report --------------------------------------------------------------
     for va, label, origin in tgt:
@@ -329,7 +399,8 @@ def main() -> None:
             m = ref_tgt == va
             for p, k in zip(ref_pc[m], ref_kind[m]):
                 p = int(p)
-                rows.append((p, f"code  {p:016x}  {label_for(p) or section_of(p):<40} {KIND[int(k)]}"))
+                detail = KIND[int(k)] if arch == "arm64" else "code"
+                rows.append((p, f"code  {p:016x}  {label_for(p) or section_of(p):<40} {detail}"))
         for p in ptr_hits.get(va, []):
             rows.append((p, f"data  {p:016x}  {section_of(p)}"))
         if not rows:

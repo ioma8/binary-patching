@@ -32,6 +32,15 @@ __attribute__((noinline)) void other_fn(void) { g_counter += 1; }
 int main(void) { target_fn(); other_fn(); target_fn(); printf("%d\n", g_counter); return 0; }
 """
 
+# i386 links no libSystem, so objects must avoid external calls (an unresolved
+# `calll 0x0` placeholder would look like a call to address 0).
+C_SRC_OBJ = r"""
+int g_counter = 0;
+__attribute__((noinline)) void target_fn(void) { g_counter += 7; }
+__attribute__((noinline)) void other_fn(void) { g_counter += 1; }
+int main(void) { target_fn(); other_fn(); target_fn(); return g_counter; }
+"""
+
 
 def run(tool, *args):
     return subprocess.run([TOOL[tool], *args], capture_output=True, text=True)
@@ -41,7 +50,7 @@ def otool_tv(path):
     out = subprocess.run(["otool", "-tv", path], capture_output=True, text=True).stdout
     rows = []
     for line in out.splitlines():
-        m = re.match(r"^([0-9a-f]{16})\t(\S+)\t?(.*)$", line)
+        m = re.match(r"^([0-9a-f]+)\t(\S+)\t?(.*)$", line)
         if m:
             rows.append((int(m.group(1), 16), m.group(2), m.group(3).strip()))
     return rows
@@ -108,6 +117,17 @@ def otool_refs_to(path, va):
     return refs
 
 
+def otool_x86_refs(path, va):
+    """x86_64 ground truth: instructions whose RIP-relative target is `va`."""
+    rows, refs = otool_tv(path), set()
+    for i, (a, _m, o) in enumerate(rows):
+        size = rows[i + 1][0] - a if i + 1 < len(rows) else 16
+        mm = re.search(r"(0x[0-9a-f]+)\(%rip\)", o)
+        if mm and a + size + int(mm.group(1), 16) == va:
+            refs.add(a)
+    return refs
+
+
 def find_callers_sites(out):
     return {int(m.group(1), 16) for m in re.finditer(r"^\s+([0-9a-f]{16})\s", out, re.M)}
 
@@ -135,12 +155,23 @@ def setUpModule():
                        check=True)
     subprocess.run(["clang", "-O0", "-arch", "arm64", "-arch", "x86_64",
                     "-o", os.path.join(d, "fat"), src], check=True)
+    # i386 links no executable (no i386 libSystem), so use relocatable objects
+    obj_src = os.path.join(d, "fx_obj.c")
+    with open(obj_src, "w") as f:
+        f.write(C_SRC_OBJ)
+    subprocess.run(["clang", "-O0", "-arch", "i386", "-c",
+                    "-o", os.path.join(d, "i386.o"), obj_src], check=True)
+    subprocess.run(["clang", "-O0", "-arch", "i386", "-arch", "x86_64", "-arch", "arm64",
+                    "-c", "-o", os.path.join(d, "multi.o"), obj_src], check=True)
     FX.update(dir=d,
               arm=os.path.join(d, "arm"), x86=os.path.join(d, "x86"),
-              fat=os.path.join(d, "fat"))
+              fat=os.path.join(d, "fat"), i386=os.path.join(d, "i386.o"),
+              multi=os.path.join(d, "multi.o"))
     for arch, key in (("arm", "arm"), ("x86", "x86")):
         FX[f"{key}_target"] = nm_sym(FX[key], "_target_fn")
         FX[f"{key}_counter"] = nm_sym(FX[key], "_g_counter")
+    FX["i386_target"] = nm_sym(FX["i386"], "_target_fn")
+    FX["i386_counter"] = nm_sym(FX["i386"], "_g_counter")
 
 
 def tearDownModule():
@@ -159,11 +190,24 @@ class TestFdis(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("adrp", r.stdout)
 
-    def test_rejects_non_arm64_thin(self):
-        """Regression: an x86_64 thin binary was silently decoded as arm64."""
+    def test_thin_x86_decodes_as_x86(self):
+        """Regression: a thin x86_64 binary was silently decoded as arm64."""
         r = run("fdis.py", FX["x86"], hex(FX["x86_target"]), "3")
-        self.assertNotEqual(r.returncode, 0)
-        self.assertIn("arm64", r.stdout + r.stderr)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("push", r.stdout)
+        self.assertNotIn("adrp", r.stdout)
+
+    def test_x86_disassembles_object(self):
+        r = run("fdis.py", FX["i386"], hex(FX["i386_target"]), "3", "--arch", "x86")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("push", r.stdout)
+        self.assertIn("mov", r.stdout)
+
+    def test_three_arch_fat_selects_each(self):
+        for arch, want in (("x86", "push"), ("x86_64", "push"), ("arm64", "adrp")):
+            r = run("fdis.py", FX["multi"], "0x0", "2", "--arch", arch)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn(want, r.stdout, arch)
 
 
 class TestFindCallers(unittest.TestCase):
@@ -178,6 +222,13 @@ class TestFindCallers(unittest.TestCase):
         expect = x86_calls_to(FX["x86"], FX["x86_target"])
         self.assertEqual(len(expect), 2)
         r = run("find_callers.py", FX["x86"], "--arch", "x86_64", "_target_fn")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(find_callers_sites(r.stdout), expect)
+
+    def test_x86_exact_on_object(self):
+        expect = x86_calls_to(FX["i386"], FX["i386_target"])
+        self.assertEqual(len(expect), 2)
+        r = run("find_callers.py", FX["i386"], "--arch", "x86", "_target_fn")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(find_callers_sites(r.stdout), expect)
 
@@ -225,12 +276,22 @@ class TestFindRefs(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("non-data", r.stdout + r.stderr)
 
-    def test_x86_code_scan_refused_and_ptr_ok(self):
-        bad = run("find_refs.py", FX["x86"], "--arch", "x86_64", hex(FX["x86_counter"]))
-        self.assertNotEqual(bad.returncode, 0)
-        ok = run("find_refs.py", FX["x86"], "--arch", "x86_64", "--no-code",
-                 hex(FX["x86_counter"]))
+    def test_x86_64_code_refs_exact(self):
+        expect = otool_x86_refs(FX["x86"], FX["x86_counter"])
+        self.assertEqual(len(expect), 5)
+        r = run("find_refs.py", FX["x86"], "--arch", "x86_64", "--no-ptr",
+                hex(FX["x86_counter"]))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(find_refs_sites(r.stdout, "code"), expect)
+
+    def test_x86_ptr_scan_and_arch(self):
+        ok = run("find_refs.py", FX["i386"], "--arch", "x86", "--no-code",
+                 hex(FX["i386_counter"]))
         self.assertEqual(ok.returncode, 0, ok.stderr)
+
+    def test_x86_arch_mismatch_fails(self):
+        r = run("find_refs.py", FX["x86"], "--arch", "arm64", hex(FX["x86_counter"]))
+        self.assertNotEqual(r.returncode, 0)
 
 
 class TestPatch(unittest.TestCase):
@@ -277,6 +338,21 @@ class TestPatch(unittest.TestCase):
         r = run("patch.py", tgt, m)
         self.assertEqual(r.returncode, 0, r.stdout)
         self.assertIn(hex(FX["arm_target"]), r.stdout)
+
+    def test_x86_symbol_site_at_zero(self):
+        """An object's first function sits at address 0; lookup must not skip it."""
+        tgt = self._copy(FX["i386"])
+        m = self._manifest("x86 _target_fn - c3\n")
+        r = run("patch.py", tgt, m)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("va=0x00000000", r.stdout)
+
+    def test_three_arch_wildcard(self):
+        tgt = self._copy(FX["multi"])
+        m = self._manifest("* _target_fn - c3\n")
+        r = run("patch.py", tgt, m)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("3 site(s)", r.stdout)
 
     def test_arch_line_without_slice_fails(self):
         """Regression: a manifest for the wrong arch exited 0 as a silent no-op."""

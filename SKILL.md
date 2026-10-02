@@ -77,29 +77,36 @@ audit trail that stops you re-testing the same guess.
   scanning its direct-branch immediates (`bl` on arm64, `call rel32` on x86):
   exact and O(n), unlike `adrp+add` string-xref heuristics that miss indirection.
   The caller count is the blast radius of a patch. `find_callers.py` (in this
-  folder) does it vectorized — `./find_callers.py <file> <0xADDR|name>...`,
-  arm64 + x86_64, ~10 ms scan on a 56 MB slice, annotating each site with its
-  containing symbol; it misses indirect/PLT/vtable calls and arm64 tail-calls.
+  folder) does it vectorized — `./find_callers.py <file> <0xADDR|name>...
+  [--arch arm64|x86_64|x86]`, ~10 ms scan on a 56 MB slice, annotating each
+  site with its containing symbol. arm64 is exact (BL is fixed-width); the
+  x86/x86_64 scan keys off the `0xE8` opcode byte and is a heuristic — it finds
+  every real call but can add a spurious one. Misses indirect/PLT/vtable calls,
+  arm64 tail-calls and the other arch slice.
 - **codesign** — `-f -s -` the framework, then `--deep --force` the app; delete
   stray bundle-root artifacts first. On a hardened-runtime app re-sign **ad-hoc
   without runtime**: library validation rejects the freshly re-signed bundled
   dylibs if runtime is kept (`resign.py` below does this).
 - **osascript** — drive a user action (`tell app "X" to quit`) to capture the
   *correct* backtrace for the split-point diff.
-- **fdis.py** (in this folder) — the fast disassembler: `./fdis.py <file> <addr> [n]`
-  prints `vmaddr fileoff bytes mnemonic operands` by seeking straight to the
-  address — O(n), ~35 ms — instead of dumping the whole `__TEXT` like `otool`
-  (~510 ms) or r2 `pd` (~380 ms). Default for a bare bytes/mnemonic peek at a
-  known address; still use r2 for structural queries and `wx`.
-- **find_refs.py** (in this folder) — "who references X": code refs (`adrp+add`,
-  `adrp+ldr/str`, `adr`) plus pointer refs in data (vtables, dispatch tables,
-  `RESSTR` indirection). `./find_refs.py <file> <0xADDR|name>... [--str <text>]`.
-  Vectorized; catches the indirection a call scan cannot see.
+- **fdis.py** (in this folder) — the fast disassembler for **arm64, x86_64 and
+  i386**: `./fdis.py <file> <addr> [n] [--arch arm64|x86_64|x86]` prints
+  `vmaddr fileoff bytes mnemonic operands` by seeking straight to the address —
+  O(n), ~35 ms — instead of dumping the whole `__TEXT` like `otool` (~510 ms) or
+  r2 `pd` (~380 ms). Default for a bare bytes/mnemonic peek at a known address;
+  still use r2 for structural queries and `wx`.
+- **find_refs.py** (in this folder) — "who references X": code refs plus pointer
+  refs in data (vtables, dispatch tables, `RESSTR` indirection).
+  `./find_refs.py <file> <0xADDR|name>... [--str <text>] [--arch ...]`. arm64 code
+  refs (`adrp+add`, `adrp+ldr/str`, `adr`) are exact; on x86/x86_64 they are
+  best-effort (a disassembler sweep — an `__text` jump table stops it, and i386
+  PIC refs through the GOT are not found). The pointer scan is pointer-width
+  aware and works on every arch — it catches the indirection a call scan cannot.
 - **patch.py** (in this folder) — declarative applier. Manifest lines
-  `<arch> <site> <old_hex> <new_hex>`, where `<site>` is a VA or a **symbol
-  name** (`_..._GETSTATUS$$TSTATUS`, optional `+0xoff`); symbol sites survive
-  updates that move addresses. Asserts **every** site before writing any,
-  per-slice, with `--dry-run` / `--check` / `--resign <app>`.
+  `<arch> <site> <old_hex> <new_hex>` with `<arch>` = `arm64`/`x86_64`/`x86`/`*`,
+  where `<site>` is a VA or a **symbol name** (`_..._GETSTATUS$$TSTATUS`, optional
+  `+0xoff`); symbol sites survive updates that move addresses. Asserts **every**
+  site before writing any, per-slice, with `--dry-run` / `--check` / `--resign`.
 - **resign.py** (in this folder) — `./resign.py <path> [--runtime]` signs a binary
   or `.app` ad-hoc without the hardened runtime (the working default), then
   verifies it.

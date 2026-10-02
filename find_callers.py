@@ -3,11 +3,11 @@
 # requires-python = ">=3.10"
 # dependencies = ["numpy"]
 # ///
-"""find_callers.py <file> <target>... [--arch arm64|x86_64] [--no-symbols]
+"""find_callers.py <file> <target>... [--arch arm64|x86_64|x86] [--no-symbols]
 
-Fast caller finder for Mach-O binaries. Scans `__text` for direct calls — `BL`
-(arm64) or `call rel32` (x86_64) — and prints every call site of each target,
-annotated with the containing symbol.
+Fast caller finder for Mach-O binaries (arm64, x86_64, i386). Scans `__text`
+for direct calls — `BL` (arm64) or `call rel32` (x86_64/i386) — and prints every
+call site of each target, annotated with the containing symbol.
 
 Targets are `0xADDR`, `0xADDR=Label`, or a symbol-name substring resolved from
 the Mach-O symbol table. The scan is vectorized (NumPy) and names are decoded
@@ -16,9 +16,9 @@ lazily, so a 56 MB slice resolves callers in ~10 ms.
 Columns: `call_site  caller_symbol+offset`.
 
 Misses: indirect calls (PLT/GOT/vtable, x86 `call [..]`), arm64 tail-calls (`B`),
-and calls in the other architecture slice. arm64 is exact (BL is a fixed-width,
-word-aligned opcode). The x86_64 scan keys off the `0xE8` opcode byte and is a
-heuristic: it finds every real direct call, but can add a spurious caller (on
+and calls in the other architecture slices. arm64 is exact (BL is a fixed-width,
+word-aligned opcode). The x86/x86_64 scan keys off the `0xE8` opcode byte and is
+a heuristic: it finds every real direct call, but can add a spurious caller (on
 /bin/ls, 4 of 23 targets gained one). Run `fdis.py` to read a site.
 """
 import struct
@@ -28,25 +28,28 @@ import numpy as np
 
 FAT_MAGIC = 0xCAFEBABE
 FAT_MAGIC_64 = 0xCAFEBABF
+MH_MAGIC = 0xFEEDFACE
 MH_MAGIC_64 = 0xFEEDFACF
-CPU_ARM64 = 0x0100000C
-CPU_X86_64 = 0x01000007
+LC_SEGMENT = 0x01
 LC_SEGMENT_64 = 0x19
 LC_SYMTAB = 0x02
-NLIST64 = np.dtype([("n_strx", "<u4"), ("n_type", "u1"), ("n_sect", "u1"),
-                    ("n_desc", "<u2"), ("n_value", "<u8")])
+CPU = {"arm64": 0x0100000C, "x86_64": 0x01000007, "x86": 0x00000007}
+CPU_NAME = {v: k for k, v in CPU.items()}
+NLIST = {True: np.dtype([("n_strx", "<u4"), ("n_type", "u1"), ("n_sect", "u1"),
+                         ("n_desc", "<u2"), ("n_value", "<u8")]),
+         False: np.dtype([("n_strx", "<u4"), ("n_type", "u1"), ("n_sect", "u1"),
+                          ("n_desc", "<u2"), ("n_value", "<u4")])}
 
 
 def pick_slice(data: bytes, want_cpu: int):
     """(base_fileoff, size, cputype) of the requested slice; auto-detects thin."""
-    if struct.unpack("<I", data[:4])[0] == MH_MAGIC_64:
+    if struct.unpack("<I", data[:4])[0] in (MH_MAGIC, MH_MAGIC_64):
         return 0, len(data), struct.unpack("<I", data[4:8])[0]
     magic = struct.unpack(">I", data[:4])[0]
     if magic not in (FAT_MAGIC, FAT_MAGIC_64):
         raise SystemExit("not a Mach-O / fat Mach-O")
-    nfat = struct.unpack(">I", data[4:8])[0]
     off = 8
-    for _ in range(nfat):
+    for _ in range(struct.unpack(">I", data[4:8])[0]):
         if magic == FAT_MAGIC_64:
             cputype = struct.unpack(">I", data[off:off + 4])[0]
             offset, size = struct.unpack(">QQ", data[off + 8:off + 24])
@@ -60,21 +63,24 @@ def pick_slice(data: bytes, want_cpu: int):
     raise SystemExit("requested slice not present in fat binary")
 
 
-def load_commands(data: bytes, base: int):
+def load_commands(data: bytes, base: int, is64: bool):
     """(__text section, symtab) — offsets relative to the slice start."""
     ncmds = struct.unpack_from("<I", data, base + 16)[0]
-    off = base + 32
+    off = base + (32 if is64 else 28)
     text = symtab = None
     for _ in range(ncmds):
         cmd, cmdsize = struct.unpack_from("<II", data, off)
         if cmd == LC_SEGMENT_64:
-            nsects = struct.unpack_from("<I", data, off + 64)[0]
-            so = off + 72
-            for _ in range(nsects):
-                if data[so:so + 16].split(b"\0", 1)[0] == b"__text":
-                    text = struct.unpack_from("<QQI", data, so + 32)  # addr, size, off
-                so += 80
-        elif cmd == LC_SYMTAB:
+            nsects, so, secsz = struct.unpack_from("<I", data, off + 64)[0], off + 72, 80
+        elif cmd == LC_SEGMENT:
+            nsects, so, secsz = struct.unpack_from("<I", data, off + 48)[0], off + 56, 68
+        else:
+            nsects = 0
+        for _ in range(nsects):
+            if data[so:so + 16].split(b"\0", 1)[0] == b"__text":
+                text = struct.unpack_from("<QQI" if is64 else "<III", data, so + 32)
+            so += secsz
+        if cmd == LC_SYMTAB:
             symtab = struct.unpack_from("<IIII", data, off + 8)
         off += cmdsize
     return text, symtab
@@ -118,16 +124,19 @@ def main() -> None:
         raise SystemExit(1)
     path, target_args = pos[0], pos[1:]
 
-    want_cpu = {"arm64": CPU_ARM64, "x86_64": CPU_X86_64}.get(arch)
+    want_cpu = CPU.get(arch)
     if want_cpu is None:
-        raise SystemExit(f"unknown --arch {arch!r}; use arm64|x86_64")
+        raise SystemExit(f"unknown --arch {arch!r}; use arm64|x86_64|x86")
     data = open(path, "rb").read()
     base, _size, cputype = pick_slice(data, want_cpu)
     if explicit and cputype != want_cpu:
         raise SystemExit(f"--arch {arch}: no {arch} slice in this thin binary")
-    arch = "arm64" if cputype == CPU_ARM64 else "x86_64"
+    arch = CPU_NAME.get(cputype)
+    if arch is None:
+        raise SystemExit(f"unsupported cputype {cputype:#x}")
+    is64 = struct.unpack("<I", data[base:base + 4])[0] == MH_MAGIC_64
 
-    text, symtab = load_commands(data, base)
+    text, symtab = load_commands(data, base, is64)
     if text is None:
         raise SystemExit("no __text section")
     text_va, text_size, text_off = text
@@ -149,14 +158,16 @@ def main() -> None:
     if symbols_on and symtab is not None:
         symoff, nsyms, stroff, _strsize = symtab
         sym_strbase = base + stroff
-        arr = np.frombuffer(data, dtype=NLIST64, count=nsyms, offset=base + symoff)
-        keep = ((arr["n_type"] & 0x0E) == 0x0E) & ((arr["n_type"] & 0xE0) == 0) \
-            & (arr["n_value"] > 0)
+        arr = np.frombuffer(data, dtype=NLIST[is64], count=nsyms, offset=base + symoff)
+        keep = ((arr["n_type"] & 0x0E) == 0x0E) & ((arr["n_type"] & 0xE0) == 0)  # N_SECT, not a stab
         sel = np.flatnonzero(keep)
         kstrx = arr["n_strx"][sel].astype(np.int64)
         kva = arr["n_value"][sel].astype(np.int64)
-        order = np.argsort(kva, kind="stable")
-        sym_va, sym_strx = kva[order], kstrx[order]
+        if kva.size and np.all(np.diff(kva) >= 0):
+            sym_va, sym_strx = kva, kstrx                # table already address-ordered
+        elif kva.size:
+            order = np.argsort(kva, kind="stable")
+            sym_va, sym_strx = kva[order], kstrx[order]
         uniq_strx = np.unique(arr["n_strx"])  # ALL name starts, incl. filtered symbols
 
     def label_for(va: int) -> str:

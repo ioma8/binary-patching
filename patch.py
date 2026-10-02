@@ -9,7 +9,7 @@ Apply a declarative patch manifest to a Mach-O binary, per architecture slice,
 asserting the pristine bytes at every site before writing any of them.
 
 Manifest: one site per line, `<arch> <site> <old_hex> <new_hex>  # comment`
-  arch    arm64 | x86_64 | *   (* = every slice)
+  arch    arm64 | x86_64 | x86 | *   (* = every slice)
   site    a virtual address (`0x1000d7740`) or a symbol name from the symbol
           table, optionally `+0xoff` (e.g. `_BCLOCK..._GETSTATUS$$TSTATUS`).
           Symbol sites survive app updates that move the addresses.
@@ -33,16 +33,17 @@ import sys
 
 FAT_MAGIC = 0xCAFEBABE
 FAT_MAGIC_64 = 0xCAFEBABF
+MH_MAGIC = 0xFEEDFACE
 MH_MAGIC_64 = 0xFEEDFACF
-CPU_NAMES = {0x0100000C: "arm64", 0x01000007: "x86_64"}
+CPU_NAMES = {0x0100000C: "arm64", 0x01000007: "x86_64", 0x00000007: "x86"}
+LC_SEGMENT = 0x01
 LC_SEGMENT_64 = 0x19
 LC_SYMTAB = 0x02
-NLIST64_SIZE = 16
 
 
 def slice_list(data: bytes):
     """[(arch_name, base_fileoff, size)] for every slice."""
-    if struct.unpack("<I", data[:4])[0] == MH_MAGIC_64:
+    if struct.unpack("<I", data[:4])[0] in (MH_MAGIC, MH_MAGIC_64):
         cpu = struct.unpack("<I", data[4:8])[0]
         return [(CPU_NAMES.get(cpu, hex(cpu)), 0, len(data))]
     magic = struct.unpack(">I", data[:4])[0]
@@ -62,15 +63,16 @@ def slice_list(data: bytes):
     return out
 
 
-def segments(data: bytes, base: int):
+def segments(data: bytes, base: int, is64: bool):
     """[(name, vmaddr, vmsize, abs_fileoff, filesize)] for one slice."""
     ncmds = struct.unpack_from("<I", data, base + 16)[0]
-    off, segs = base + 32, []
+    off, segs = base + (32 if is64 else 28), []
     for _ in range(ncmds):
         cmd, cmdsize = struct.unpack_from("<II", data, off)
-        if cmd == LC_SEGMENT_64:
+        if cmd == (LC_SEGMENT_64 if is64 else LC_SEGMENT):
             name = data[off + 8:off + 24].split(b"\0", 1)[0].decode()
-            vmaddr, vmsize, fileoff, filesize = struct.unpack_from("<QQQQ", data, off + 24)
+            vmaddr, vmsize, fileoff, filesize = struct.unpack_from(
+                "<QQQQ" if is64 else "<IIII", data, off + 24)
             segs.append((name, vmaddr, vmsize, base + fileoff, filesize))
         off += cmdsize
     return segs
@@ -84,10 +86,10 @@ def va_to_abs(segs, va: int):
     return None
 
 
-def symtab(data: bytes, base: int):
+def symtab(data: bytes, base: int, is64: bool):
     """(abs_symoff, nsyms, abs_stroff, strsize) for one slice, or None."""
     ncmds = struct.unpack_from("<I", data, base + 16)[0]
-    off = base + 32
+    off = base + (32 if is64 else 28)
     for _ in range(ncmds):
         cmd, cmdsize = struct.unpack_from("<II", data, off)
         if cmd == LC_SYMTAB:
@@ -97,27 +99,29 @@ def symtab(data: bytes, base: int):
     return None
 
 
-def lookup_symbol(data: bytes, st, name: str):
-    """Unslid VA of `name` (exact match, n_value > 0), or None.
+def lookup_symbol(data: bytes, st, name: str, is64: bool):
+    """Unslid VA of `name` (exact match, a defined N_SECT symbol), or None.
 
     Finds the name in the string table, then the nlist entry whose n_strx
     points at it — a couple of C-speed byte scans, no per-symbol Python loop.
+    A defined symbol may legitimately sit at address 0 (object files).
     """
     if st is None:
         return None
     symoff, nsyms, stroff, strsize = st
+    esz, vsz = (16, 8) if is64 else (12, 4)
     want, end = name.encode(), stroff + strsize
     p = data.find(want, stroff, end)
     while p >= 0:
         if p + len(want) < end and data[p + len(want)] == 0 \
                 and (p == stroff or data[p - 1] == 0):
             pat = struct.pack("<I", p - stroff)          # n_strx to find
-            region_end, s = symoff + nsyms * NLIST64_SIZE, symoff
+            region_end, s = symoff + nsyms * esz, symoff
             while (q := data.find(pat, s, region_end)) >= 0:
-                if (q - symoff) % NLIST64_SIZE == 0:      # the n_strx field
-                    nval = int.from_bytes(data[q + 8:q + 16], "little")
-                    if nval:
-                        return nval
+                if (q - symoff) % esz == 0:               # the n_strx field
+                    n_type = data[q + 4]
+                    if (n_type & 0x0E) == 0x0E and (n_type & 0xE0) == 0:  # N_SECT
+                        return int.from_bytes(data[q + 8:q + 8 + vsz], "little")
                 s = q + 1
         p = data.find(want, p + 1, end)
     return None
@@ -143,8 +147,8 @@ def parse_manifest(text: str):
         if len(p) != 4:
             raise SystemExit(f"manifest line {ln}: expected <arch> <site> <old_hex> <new_hex>")
         arch, loc, old_s, new_s = p[0].lower(), p[1], p[2], p[3]
-        if arch not in ("arm64", "x86_64", "*"):
-            raise SystemExit(f"manifest line {ln}: arch must be arm64|x86_64|*")
+        if arch not in ("arm64", "x86_64", "x86", "*"):
+            raise SystemExit(f"manifest line {ln}: arch must be arm64|x86_64|x86|*")
         old = None if old_s == "-" else bytes.fromhex(old_s.removeprefix("0x"))
         new = bytes.fromhex(new_s.removeprefix("0x"))
         if old is not None and len(old) != len(new):
@@ -175,7 +179,9 @@ def main() -> None:
     path, manifest = pos
     data = bytearray(open(path, "rb").read())
     sl = slice_list(data)
-    seg_cache = {name: segments(data, base) for name, base, _s in sl}
+    is64_of = {name: struct.unpack("<I", data[base:base + 4])[0] == MH_MAGIC_64
+               for name, base, _s in sl}
+    seg_cache = {name: segments(data, base, is64_of[name]) for name, base, _s in sl}
 
     actions, errors = [], []
     sym_cache: dict[str, object] = {}
@@ -191,8 +197,8 @@ def main() -> None:
                 va = a
             else:
                 if name not in sym_cache:
-                    sym_cache[name] = symtab(data, base)
-                va = lookup_symbol(data, sym_cache[name], a)
+                    sym_cache[name] = symtab(data, base, is64_of[name])
+                va = lookup_symbol(data, sym_cache[name], a, is64_of[name])
                 if va is None:
                     errors.append(f"line {ln}: symbol {a!r} not found in {name} slice")
                     continue
